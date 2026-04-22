@@ -25,7 +25,8 @@ public:
     CONNECT_FAIL,
     CONNECTION_DROPPED,
     CONNECTION_CLOSED_GRACEFULLY,
-    MESSAGE
+    MESSAGE,
+    BINARY_AUDIO   /* binary frame received from server (realtime PCM) */
   };
   typedef void (*log_emit_function)(int level, const char *line);
   typedef void (*notifyHandler_t)(const char *sessionId, const char* bugname, NotifyEvent_t event, const char* message);
@@ -80,6 +81,10 @@ public:
   bool isGracefulShutdown(void) {
     return m_gracefulShutdown;
   }
+
+  /* Binary payload accessors — only valid during a BINARY_AUDIO callback */
+  const uint8_t* getBinaryPayload(void) const { return m_binary_payload; }
+  size_t         getBinaryPayloadLen(void) const { return m_binary_payload_len; }
 
   void close() ;
 
@@ -142,6 +147,10 @@ private:
   std::string m_username;
   std::string m_password;
   bool m_gracefulShutdown;
+
+  /* binary payload scratch — written by lws thread, consumed by eventCallback */
+  uint8_t  *m_binary_payload;      /* points into in; only valid during LWS_CALLBACK_CLIENT_RECEIVE */
+  size_t    m_binary_payload_len;
 };
 
 #endif

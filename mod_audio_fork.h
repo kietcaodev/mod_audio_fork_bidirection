@@ -52,6 +52,15 @@ struct private_data {
   int audio_paused:1;
   int graceful_shutdown:1;
   char initialMetadata[8192];
+
+  /* ── Binary playback (realtime audio mode) ─────────────────────────────── */
+  switch_buffer_t   *playback_buffer;       /* ring buffer holding channel-rate PCM ready to inject */
+  switch_mutex_t    *playback_mutex;        /* protects playback_buffer */
+  SpeexResamplerState *playback_resampler;  /* lazy-init: resample 16kHz inbound -> channel native rate */
+  int  playback_input_rate;                 /* sample rate arriving from WS (default 16000) */
+  int  playback_channel_rate;               /* native channel rate (8000 for G.711, 16000 for wideband) */
+  int  playback_active:1;                   /* 1 after enableBinaryPlayback received */
+  /* ────────────────────────────────────────────────────────────────────────── */
 };
 
 typedef struct private_data private_t;

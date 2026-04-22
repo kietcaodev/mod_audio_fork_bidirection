@@ -139,7 +139,14 @@ int AudioPipe::lws_callback(struct lws *wsi,
         }
 
         if (lws_frame_is_binary(wsi)) {
-          lwsl_err("AudioPipe::lws_service_thread LWS_CALLBACK_CLIENT_RECEIVE received binary frame, discarding.\n");
+          /* Binary frame inbound: PCM from realtime provider (already channel-rate after backend resampling).
+           * Pass pointer directly — valid only for the duration of this callback.
+           * The consumer (fork_session_handle_binary) copies into the playback ring buffer. */
+          ap->m_binary_payload     = (uint8_t *) in;
+          ap->m_binary_payload_len = len;
+          ap->m_callback(ap->m_uuid.c_str(), ap->m_bugname.c_str(), AudioPipe::BINARY_AUDIO, nullptr);
+          ap->m_binary_payload     = nullptr;
+          ap->m_binary_payload_len = 0;
           return 0;
         }
 
@@ -503,6 +510,8 @@ AudioPipe::AudioPipe(const char* uuid, const char* host, unsigned int port, cons
   }
 
   m_audio_buffer = new uint8_t[m_audio_buffer_max_len];
+  m_binary_payload = nullptr;
+  m_binary_payload_len = 0;
 }
 AudioPipe::~AudioPipe() {
   if (m_audio_buffer) delete [] m_audio_buffer;

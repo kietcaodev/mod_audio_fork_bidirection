@@ -44,6 +44,30 @@ static switch_bool_t capture_callback(switch_media_bug_t *bug, void *user_data, 
 		return fork_frame(session, bug);
 		break;
 
+	case SWITCH_ABC_TYPE_WRITE_REPLACE:
+		{
+			/* Inject binary playback PCM into the outbound RTP frame (every 20 ms).
+			 * Drains tech_pvt->playback_buffer filled by fork_session_handle_binary(). */
+			private_t *tech_pvt = (private_t *) switch_core_media_bug_get_user_data(bug);
+			if (!tech_pvt || !tech_pvt->playback_active || !tech_pvt->playback_buffer) break;
+			switch_frame_t *frame = switch_core_media_bug_get_write_replace_frame(bug);
+			if (!frame || !frame->data || frame->datalen == 0) break;
+			switch_mutex_lock(tech_pvt->playback_mutex);
+			size_t available = switch_buffer_inuse(tech_pvt->playback_buffer);
+			size_t needed    = frame->datalen;
+			if (available >= needed) {
+				switch_buffer_read(tech_pvt->playback_buffer, frame->data, needed);
+				switch_core_media_bug_set_write_replace_frame(bug, frame);
+			} else if (available > 0) {
+				/* Partial fill: silence-pad the remainder */
+				switch_buffer_read(tech_pvt->playback_buffer, frame->data, available);
+				memset((uint8_t *)frame->data + available, 0, needed - available);
+				switch_core_media_bug_set_write_replace_frame(bug, frame);
+			}
+			switch_mutex_unlock(tech_pvt->playback_mutex);
+		}
+		break;
+
 	case SWITCH_ABC_TYPE_WRITE:
 	default:
 		break;
@@ -93,7 +117,7 @@ static switch_status_t start_capture(switch_core_session_t *session,
 		return SWITCH_STATUS_FALSE;
 	}
 	switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "adding bug %s.\n", bugname);
-	if ((status = switch_core_media_bug_add(session, bugname, NULL, capture_callback, pUserData, 0, flags, &bug)) != SWITCH_STATUS_SUCCESS) {
+	if ((status = switch_core_media_bug_add(session, bugname, NULL, capture_callback, pUserData, 0, flags | SMBF_WRITE_REPLACE, &bug)) != SWITCH_STATUS_SUCCESS) {
 		return status;
 	}
 	switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "setting bug private data %s.\n", bugname);

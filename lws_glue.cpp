@@ -18,6 +18,9 @@
 #include "mod_audio_fork.h"
 #include "audio_pipe.hpp"
 
+/* Forward decl: defined later in this TU inside extern "C" block */
+extern "C" void fork_session_handle_binary(private_t *tech_pvt, const uint8_t *data, size_t len);
+
 #define RTP_PACKETIZATION_PERIOD 20
 #define FRAME_SIZE_8000  320 /*which means each 20ms frame as 320 bytes at 8 khz (1 channel only)*/
 
@@ -146,6 +149,56 @@ namespace {
         tech_pvt->responseHandler(session, EVENT_JSON, jsonString);
         free(jsonString);
       }
+      /* ── Realtime binary playback control messages ─────────────────────── */
+      else if (0 == type.compare("flush")) {
+        if (tech_pvt->playback_buffer) {
+          switch_mutex_lock(tech_pvt->playback_mutex);
+          switch_buffer_zero(tech_pvt->playback_buffer);
+          switch_mutex_unlock(tech_pvt->playback_mutex);
+        }
+        switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO,
+          "(%u) flush: cleared playback buffer\n", tech_pvt->id);
+      }
+      else if (0 == type.compare("enableBinaryPlayback")) {
+        /* Optional data.sampleRate field overrides default 16000 */
+        if (jsonData) {
+          cJSON* jsonSR = cJSON_GetObjectItem(jsonData, "sampleRate");
+          if (jsonSR && jsonSR->valueint > 0)
+            tech_pvt->playback_input_rate = jsonSR->valueint;
+        }
+        /* Lazy-init the resampler when input rate differs from channel rate */
+        if (tech_pvt->playback_input_rate != tech_pvt->playback_channel_rate
+            && !tech_pvt->playback_resampler) {
+          int err = 0;
+          tech_pvt->playback_resampler = speex_resampler_init(
+            1,                               /* mono */
+            (spx_uint32_t)tech_pvt->playback_input_rate,
+            (spx_uint32_t)tech_pvt->playback_channel_rate,
+            SWITCH_RESAMPLE_QUALITY, &err);
+          if (err != RESAMPLER_ERR_SUCCESS) {
+            switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,
+              "(%u) enableBinaryPlayback: speex_resampler_init failed err=%d\n", tech_pvt->id, err);
+            tech_pvt->playback_resampler = nullptr;
+            cJSON_Delete(json);
+            return;
+          }
+        }
+        tech_pvt->playback_active = 1;
+        switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO,
+          "(%u) enableBinaryPlayback: active=1 input_rate=%d channel_rate=%d\n",
+          tech_pvt->id, tech_pvt->playback_input_rate, tech_pvt->playback_channel_rate);
+      }
+      else if (0 == type.compare("disableBinaryPlayback")) {
+        tech_pvt->playback_active = 0;
+        if (tech_pvt->playback_buffer) {
+          switch_mutex_lock(tech_pvt->playback_mutex);
+          switch_buffer_zero(tech_pvt->playback_buffer);
+          switch_mutex_unlock(tech_pvt->playback_mutex);
+        }
+        switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO,
+          "(%u) disableBinaryPlayback: active=0\n", tech_pvt->id);
+      }
+      /* ────────────────────────────────────────────────────────────────────── */
       else {
         switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "(%u) processIncomingMessage - unsupported msg type %s\n", tech_pvt->id, type.c_str());  
       }
@@ -198,6 +251,17 @@ namespace {
             case AudioPipe::MESSAGE:
               processIncomingMessage(tech_pvt, session, message);
             break;
+            case AudioPipe::BINARY_AUDIO:
+            {
+              /* message == nullptr; payload is in AudioPipe's scratch pointers */
+              AudioPipe *pAudioPipe = static_cast<AudioPipe *>(tech_pvt->pAudioPipe);
+              if (pAudioPipe && pAudioPipe->getBinaryPayload() && pAudioPipe->getBinaryPayloadLen() > 0) {
+                fork_session_handle_binary(tech_pvt,
+                  pAudioPipe->getBinaryPayload(),
+                  pAudioPipe->getBinaryPayloadLen());
+              }
+            }
+            break;
           }
         }
       }
@@ -236,6 +300,17 @@ namespace {
     tech_pvt->graceful_shutdown = 0;
     strncpy(tech_pvt->bugname, bugname, MAX_BUG_LEN);
     if (metadata) strncpy(tech_pvt->initialMetadata, metadata, MAX_METADATA_LEN);
+    
+    /* ── Init binary playback state ───────────────────────────────────────── */
+    tech_pvt->playback_active       = 0;
+    tech_pvt->playback_input_rate   = 16000;   /* backend always sends 16kHz PCM */
+    tech_pvt->playback_channel_rate = (int) read_impl.actual_samples_per_second;
+    tech_pvt->playback_resampler    = nullptr;
+    switch_mutex_init(&tech_pvt->playback_mutex, SWITCH_MUTEX_NESTED,
+      switch_core_session_get_pool(session));
+    /* 32 kbytes ~ 2 seconds of 8kHz mono PCM */
+    switch_buffer_create_dynamic(&tech_pvt->playback_buffer, 4096, 32768, 0);
+    /* ────────────────────────────────────────────────────────────────────── */
     
     size_t buflen = LWS_PRE + (FRAME_SIZE_8000 * desiredSampling / 8000 * channels * 1000 / RTP_PACKETIZATION_PERIOD * nAudioBufferSecs);
 
@@ -277,6 +352,21 @@ namespace {
       switch_mutex_destroy(tech_pvt->mutex);
       tech_pvt->mutex = nullptr;
     }
+    /* ── Binary playback cleanup ─────────────────────────────────────────── */
+    tech_pvt->playback_active = 0;
+    if (tech_pvt->playback_resampler) {
+      speex_resampler_destroy(tech_pvt->playback_resampler);
+      tech_pvt->playback_resampler = nullptr;
+    }
+    if (tech_pvt->playback_buffer) {
+      switch_buffer_destroy(&tech_pvt->playback_buffer);
+      tech_pvt->playback_buffer = nullptr;
+    }
+    if (tech_pvt->playback_mutex) {
+      switch_mutex_destroy(tech_pvt->playback_mutex);
+      tech_pvt->playback_mutex = nullptr;
+    }
+    /* ────────────────────────────────────────────────────────────────────── */
   }
 
   void lws_logger(int level, const char *line) {
@@ -614,6 +704,52 @@ extern "C" {
       switch_mutex_unlock(tech_pvt->mutex);
     }
     return SWITCH_TRUE;
+  }
+
+  /* ── fork_session_handle_binary ───────────────────────────────────────────
+   * Called from eventCallback when a BINARY_AUDIO event fires.
+   * Resamples inbound PCM (playback_input_rate → playback_channel_rate) and
+   * writes the result into the per-session ring buffer.  The WRITE_REPLACE
+   * media-bug callback drains that buffer every 20 ms.
+   * ─────────────────────────────────────────────────────────────────────── */
+  void fork_session_handle_binary(private_t *tech_pvt, const uint8_t *data, size_t len) {
+    if (!tech_pvt || !tech_pvt->playback_active || !tech_pvt->playback_buffer || !data || len == 0)
+      return;
+
+    const int16_t *in_pcm   = (const int16_t *) data;
+    spx_uint32_t   in_len   = (spx_uint32_t)(len / 2);  /* samples */
+
+    const int16_t *write_ptr    = in_pcm;
+    spx_uint32_t   write_samples = in_len;
+
+    /* Resample if needed (e.g. 16kHz → 8kHz for G.711 channels) */
+    int16_t resampled[2048];
+    if (tech_pvt->playback_resampler) {
+      spx_uint32_t out_len = (spx_uint32_t)(sizeof(resampled) / sizeof(int16_t));
+      speex_resampler_process_int(tech_pvt->playback_resampler, 0,
+        in_pcm, &in_len,
+        resampled, &out_len);
+      write_ptr     = resampled;
+      write_samples = out_len;
+    }
+
+    if (write_samples == 0) return;
+
+    size_t write_bytes = write_samples * 2;
+    const size_t MAX_BUFFER = 32000;  /* ~2 s at 8kHz mono */
+
+    switch_mutex_lock(tech_pvt->playback_mutex);
+    size_t inuse = switch_buffer_inuse(tech_pvt->playback_buffer);
+    if (inuse + write_bytes > MAX_BUFFER) {
+      /* Overflow: drop oldest data to make room */
+      size_t drop = (inuse + write_bytes) - MAX_BUFFER;
+      if (drop > inuse) drop = inuse;
+      switch_buffer_toss(tech_pvt->playback_buffer, drop);
+      switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+        "(%u) playback buffer overflow — dropped %zu bytes\n", tech_pvt->id, drop);
+    }
+    switch_buffer_write(tech_pvt->playback_buffer, write_ptr, write_bytes);
+    switch_mutex_unlock(tech_pvt->playback_mutex);
   }
 
 }
