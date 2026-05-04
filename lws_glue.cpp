@@ -12,6 +12,7 @@
 #include <fstream>
 #include <sstream>
 #include <regex>
+#include <vector>
 
 #include "base64.hpp"
 #include "parser.hpp"
@@ -19,7 +20,7 @@
 #include "audio_pipe.hpp"
 
 /* Forward decl: defined later in this TU inside extern "C" block */
-extern "C" void fork_session_handle_binary(private_t *tech_pvt, const uint8_t *data, size_t len);
+extern "C" void fork_session_handle_binary(private_t *tech_pvt, switch_core_session_t *session, const uint8_t *data, size_t len);
 
 #define RTP_PACKETIZATION_PERIOD 20
 #define FRAME_SIZE_8000  320 /*which means each 20ms frame as 320 bytes at 8 khz (1 channel only)*/
@@ -33,6 +34,60 @@ namespace {
   static unsigned int nServiceThreads = std::max(1, std::min(requestedNumServiceThreads ? ::atoi(requestedNumServiceThreads) : 1, 5));
   static unsigned int idxCallCount = 0;
   static uint32_t playCount = 0;
+
+  static switch_status_t write_playback_frames_direct(private_t *tech_pvt, switch_core_session_t *session) {
+    if (!tech_pvt || !session || !tech_pvt->playback_direct_mode || !tech_pvt->playback_codec_ready ||
+        !tech_pvt->playback_buffer || !tech_pvt->playback_mutex || tech_pvt->playback_frame_bytes <= 0) {
+      return SWITCH_STATUS_FALSE;
+    }
+
+    switch_channel_t *channel = switch_core_session_get_channel(session);
+    if (!channel || !switch_channel_ready(channel)) {
+      return SWITCH_STATUS_FALSE;
+    }
+
+    std::vector<uint8_t> chunk((size_t)tech_pvt->playback_frame_bytes);
+
+    while (true) {
+      size_t bytes_read = 0;
+      switch_mutex_lock(tech_pvt->playback_mutex);
+      size_t available = switch_buffer_inuse(tech_pvt->playback_buffer);
+      if (available >= (size_t)tech_pvt->playback_frame_bytes) {
+        bytes_read = switch_buffer_read(tech_pvt->playback_buffer, chunk.data(), (size_t)tech_pvt->playback_frame_bytes);
+      }
+      switch_mutex_unlock(tech_pvt->playback_mutex);
+
+      if (bytes_read < (size_t)tech_pvt->playback_frame_bytes) {
+        break;
+      }
+
+      switch_frame_t frame = { 0 };
+      frame.codec = &tech_pvt->playback_codec;
+      frame.data = chunk.data();
+      frame.buflen = (uint32_t)bytes_read;
+      frame.datalen = (uint32_t)bytes_read;
+      frame.samples = (uint32_t)(bytes_read / sizeof(int16_t));
+      frame.channels = 1;
+      frame.rate = tech_pvt->playback_channel_rate;
+
+      switch_status_t status = switch_core_session_write_frame(session, &frame, SWITCH_IO_FLAG_NONE, 0);
+      if (status != SWITCH_STATUS_SUCCESS) {
+        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
+          "(%u) direct playback write failed: status=%d bytes=%zu\n",
+          tech_pvt->id, status, bytes_read);
+        return status;
+      }
+
+      if (!tech_pvt->playback_logged_first_direct_write) {
+        tech_pvt->playback_logged_first_direct_write = 1;
+        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
+          "(%u) direct playback write active: frame_bytes=%d channel_rate=%d\n",
+          tech_pvt->id, tech_pvt->playback_frame_bytes, tech_pvt->playback_channel_rate);
+      }
+    }
+
+    return SWITCH_STATUS_SUCCESS;
+  }
 
   void processIncomingMessage(private_t* tech_pvt, switch_core_session_t* session, const char* message) {
     std::string msg = message;
@@ -257,6 +312,7 @@ namespace {
               AudioPipe *pAudioPipe = static_cast<AudioPipe *>(tech_pvt->pAudioPipe);
               if (pAudioPipe && pAudioPipe->getBinaryPayload() && pAudioPipe->getBinaryPayloadLen() > 0) {
                 fork_session_handle_binary(tech_pvt,
+                  session,
                   pAudioPipe->getBinaryPayload(),
                   pAudioPipe->getBinaryPayloadLen());
               }
@@ -276,9 +332,11 @@ namespace {
     const char* password = nullptr;
     int err;
     switch_codec_implementation_t read_impl;
+    switch_codec_implementation_t write_impl;
     switch_channel_t *channel = switch_core_session_get_channel(session);
 
     switch_core_session_get_read_impl(session, &read_impl);
+    switch_core_session_get_write_impl(session, &write_impl);
   
     if (username = switch_channel_get_variable(channel, "MOD_AUDIO_BASIC_AUTH_USERNAME")) {
       password = switch_channel_get_variable(channel, "MOD_AUDIO_BASIC_AUTH_PASSWORD");
@@ -304,12 +362,41 @@ namespace {
     /* ── Init binary playback state ───────────────────────────────────────── */
     tech_pvt->playback_active       = 0;
     tech_pvt->playback_input_rate   = 16000;   /* backend always sends 16kHz PCM */
-    tech_pvt->playback_channel_rate = (int) read_impl.actual_samples_per_second;
+    tech_pvt->playback_channel_rate = (int) (write_impl.actual_samples_per_second ?
+      write_impl.actual_samples_per_second : read_impl.actual_samples_per_second);
     tech_pvt->playback_resampler    = nullptr;
+    tech_pvt->playback_frame_bytes  = (int) (write_impl.decoded_bytes_per_packet ?
+      write_impl.decoded_bytes_per_packet : read_impl.decoded_bytes_per_packet);
+    tech_pvt->playback_direct_mode  = 0;
+    tech_pvt->playback_codec_ready  = 0;
+    tech_pvt->playback_logged_first_direct_write = 0;
+    tech_pvt->playback_logged_write_replace_skip = 0;
     switch_mutex_init(&tech_pvt->playback_mutex, SWITCH_MUTEX_NESTED,
       switch_core_session_get_pool(session));
     /* 32 kbytes ~ 2 seconds of 8kHz mono PCM */
     switch_buffer_create_dynamic(&tech_pvt->playback_buffer, 4096, 32768, 0);
+
+    if (tech_pvt->playback_channel_rate > 0 && tech_pvt->playback_frame_bytes > 0 &&
+        switch_core_codec_init(&tech_pvt->playback_codec,
+          "L16",
+          NULL,
+          NULL,
+          tech_pvt->playback_channel_rate,
+          (write_impl.microseconds_per_packet ? write_impl.microseconds_per_packet : read_impl.microseconds_per_packet) / 1000,
+          1,
+          SWITCH_CODEC_FLAG_ENCODE | SWITCH_CODEC_FLAG_DECODE,
+          NULL,
+          switch_core_session_get_pool(session)) == SWITCH_STATUS_SUCCESS) {
+      tech_pvt->playback_codec_ready = 1;
+      tech_pvt->playback_direct_mode = 1;
+      switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
+        "(%u) playback direct mode armed: channel_rate=%d frame_bytes=%d\n",
+        tech_pvt->id, tech_pvt->playback_channel_rate, tech_pvt->playback_frame_bytes);
+    } else {
+      switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING,
+        "(%u) playback direct mode unavailable, falling back to WRITE_REPLACE queue\n",
+        tech_pvt->id);
+    }
     /* ────────────────────────────────────────────────────────────────────── */
     
     size_t buflen = LWS_PRE + (FRAME_SIZE_8000 * desiredSampling / 8000 * channels * 1000 / RTP_PACKETIZATION_PERIOD * nAudioBufferSecs);
@@ -357,6 +444,10 @@ namespace {
     if (tech_pvt->playback_resampler) {
       speex_resampler_destroy(tech_pvt->playback_resampler);
       tech_pvt->playback_resampler = nullptr;
+    }
+    if (tech_pvt->playback_codec_ready) {
+      switch_core_codec_destroy(&tech_pvt->playback_codec);
+      tech_pvt->playback_codec_ready = 0;
     }
     if (tech_pvt->playback_buffer) {
       switch_buffer_destroy(&tech_pvt->playback_buffer);
@@ -708,11 +799,11 @@ extern "C" {
 
   /* ── fork_session_handle_binary ───────────────────────────────────────────
    * Called from eventCallback when a BINARY_AUDIO event fires.
-   * Resamples inbound PCM (playback_input_rate → playback_channel_rate) and
-   * writes the result into the per-session ring buffer.  The WRITE_REPLACE
-   * media-bug callback drains that buffer every 20 ms.
+   * Resamples inbound PCM (playback_input_rate → playback_channel_rate),
+   * writes the result into the per-session ring buffer, then tries direct
+   * session playback on parked calls. WRITE_REPLACE remains as a fallback.
    * ─────────────────────────────────────────────────────────────────────── */
-  void fork_session_handle_binary(private_t *tech_pvt, const uint8_t *data, size_t len) {
+  void fork_session_handle_binary(private_t *tech_pvt, switch_core_session_t *session, const uint8_t *data, size_t len) {
     if (!tech_pvt || !tech_pvt->playback_active || !tech_pvt->playback_buffer || !data || len == 0)
       return;
 
@@ -750,6 +841,10 @@ extern "C" {
     }
     switch_buffer_write(tech_pvt->playback_buffer, write_ptr, write_bytes);
     switch_mutex_unlock(tech_pvt->playback_mutex);
+
+    if (tech_pvt->playback_direct_mode && session) {
+      write_playback_frames_direct(tech_pvt, session);
+    }
   }
 
 }

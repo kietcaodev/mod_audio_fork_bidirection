@@ -19,5 +19,5 @@ switch_status_t fork_service_threads();
 switch_status_t fork_session_connect(void **ppUserData);
 
 /* Binary playback: push inbound PCM into per-session ring buffer (with resampling). */
-void fork_session_handle_binary(private_t *tech_pvt, const uint8_t *data, size_t len);
+void fork_session_handle_binary(private_t *tech_pvt, switch_core_session_t *session, const uint8_t *data, size_t len);
 #endif

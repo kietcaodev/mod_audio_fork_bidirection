@@ -50,6 +50,15 @@ static switch_bool_t capture_callback(switch_media_bug_t *bug, void *user_data, 
 			 * Drains tech_pvt->playback_buffer filled by fork_session_handle_binary(). */
 			private_t *tech_pvt = (private_t *) switch_core_media_bug_get_user_data(bug);
 			if (!tech_pvt || !tech_pvt->playback_active || !tech_pvt->playback_buffer) break;
+			if (tech_pvt->playback_direct_mode) {
+				if (!tech_pvt->playback_logged_write_replace_skip) {
+					tech_pvt->playback_logged_write_replace_skip = 1;
+					switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
+						"(%u) WRITE_REPLACE bypassed: direct playback mode active for parked-call fallback\n",
+						tech_pvt->id);
+				}
+				break;
+			}
 			switch_frame_t *frame = switch_core_media_bug_get_write_replace_frame(bug);
 			if (!frame || !frame->data || frame->datalen == 0) break;
 			switch_mutex_lock(tech_pvt->playback_mutex);

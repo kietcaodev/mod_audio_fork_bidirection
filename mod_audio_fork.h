@@ -57,9 +57,15 @@ struct private_data {
   switch_buffer_t   *playback_buffer;       /* ring buffer holding channel-rate PCM ready to inject */
   switch_mutex_t    *playback_mutex;        /* protects playback_buffer */
   SpeexResamplerState *playback_resampler;  /* lazy-init: resample 16kHz inbound -> channel native rate */
+  switch_codec_t    playback_codec;         /* L16 codec used for direct caller playback */
   int  playback_input_rate;                 /* sample rate arriving from WS (default 16000) */
   int  playback_channel_rate;               /* native channel rate (8000 for G.711, 16000 for wideband) */
+  int  playback_frame_bytes;                /* one outbound packet in decoded linear bytes */
   int  playback_active:1;                   /* 1 after enableBinaryPlayback received */
+  int  playback_direct_mode:1;              /* 1 when direct switch_core_session_write_frame is active */
+  int  playback_codec_ready:1;              /* L16 playback codec initialized */
+  int  playback_logged_first_direct_write:1;
+  int  playback_logged_write_replace_skip:1;
   /* ────────────────────────────────────────────────────────────────────────── */
 };
 
