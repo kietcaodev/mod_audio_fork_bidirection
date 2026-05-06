@@ -66,6 +66,11 @@ struct private_data {
   int  playback_codec_ready:1;              /* L16 playback codec initialized */
   int  playback_logged_first_direct_write:1;
   int  playback_logged_write_replace_skip:1;
+  /* ── Debug counters ────────────────────────────────────────────────────── */
+  uint32_t dbg_binary_frames_rx;           /* total binary frames received from WS */
+  uint32_t dbg_wr_frames_full;             /* WRITE_REPLACE: full frames sent */
+  uint32_t dbg_wr_frames_partial;          /* WRITE_REPLACE: partial (silence-padded) frames */
+  uint32_t dbg_wr_frames_underrun;         /* WRITE_REPLACE: empty buffer (silence kept) */
   /* ────────────────────────────────────────────────────────────────────────── */
 };
 

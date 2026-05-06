@@ -67,11 +67,33 @@ static switch_bool_t capture_callback(switch_media_bug_t *bug, void *user_data, 
 			if (available >= needed) {
 				switch_buffer_read(tech_pvt->playback_buffer, frame->data, needed);
 				switch_core_media_bug_set_write_replace_frame(bug, frame);
+				tech_pvt->dbg_wr_frames_full++;
+				/* Log first frame + every 50th */
+				if (tech_pvt->dbg_wr_frames_full == 1 || tech_pvt->dbg_wr_frames_full % 50 == 0) {
+					switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
+						"(%u) [MOD-WR] full #%u needed=%zu avail_before=%zu avail_after=%zu\n",
+						tech_pvt->id, tech_pvt->dbg_wr_frames_full,
+						needed, available,
+						switch_buffer_inuse(tech_pvt->playback_buffer));
+				}
 			} else if (available > 0) {
 				/* Partial fill: silence-pad the remainder */
 				switch_buffer_read(tech_pvt->playback_buffer, frame->data, available);
 				memset((uint8_t *)frame->data + available, 0, needed - available);
 				switch_core_media_bug_set_write_replace_frame(bug, frame);
+				tech_pvt->dbg_wr_frames_partial++;
+				switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING,
+					"(%u) [MOD-WR] PARTIAL #%u needed=%zu avail=%zu (silence-padded %zu B)\n",
+					tech_pvt->id, tech_pvt->dbg_wr_frames_partial,
+					needed, available, needed - available);
+			} else {
+				/* Empty buffer — FreeSWITCH keeps original frame (silence / last frame) */
+				tech_pvt->dbg_wr_frames_underrun++;
+				if (tech_pvt->dbg_wr_frames_underrun % 100 == 1) {
+					switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG,
+						"(%u) [MOD-WR] underrun #%u (buf empty, keeping silence)\n",
+						tech_pvt->id, tech_pvt->dbg_wr_frames_underrun);
+				}
 			}
 			switch_mutex_unlock(tech_pvt->playback_mutex);
 		}

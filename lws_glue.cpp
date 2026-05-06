@@ -388,9 +388,9 @@ namespace {
           NULL,
           switch_core_session_get_pool(session)) == SWITCH_STATUS_SUCCESS) {
       tech_pvt->playback_codec_ready = 1;
-      tech_pvt->playback_direct_mode = 1;
+      tech_pvt->playback_direct_mode = 0;  /* force WRITE_REPLACE — paced by FS media timer */
       switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
-        "(%u) playback direct mode armed: channel_rate=%d frame_bytes=%d\n",
+        "(%u) playback WRITE_REPLACE mode armed: channel_rate=%d frame_bytes=%d\n",
         tech_pvt->id, tech_pvt->playback_channel_rate, tech_pvt->playback_frame_bytes);
     } else {
       switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING,
@@ -837,14 +837,22 @@ extern "C" {
       if (drop > inuse) drop = inuse;
       switch_buffer_toss(tech_pvt->playback_buffer, drop);
       switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
-        "(%u) playback buffer overflow — dropped %zu bytes\n", tech_pvt->id, drop);
+        "(%u) [MOD-BINARY] OVERFLOW: dropped %zu B | inuse_before=%zu write_bytes=%zu\n",
+        tech_pvt->id, drop, inuse, write_bytes);
     }
     switch_buffer_write(tech_pvt->playback_buffer, write_ptr, write_bytes);
+    size_t inuse_after = switch_buffer_inuse(tech_pvt->playback_buffer);
     switch_mutex_unlock(tech_pvt->playback_mutex);
 
-    if (tech_pvt->playback_direct_mode && session) {
-      write_playback_frames_direct(tech_pvt, session);
+    tech_pvt->dbg_binary_frames_rx++;
+    /* Log first frame + every 50th to confirm steady-state flow without spamming */
+    if (tech_pvt->dbg_binary_frames_rx == 1 || tech_pvt->dbg_binary_frames_rx % 50 == 0) {
+      switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO,
+        "(%u) [MOD-BINARY] rx_frame=#%u in=%zuB out=%zuB buf_inuse=%zu/%zu\n",
+        tech_pvt->id, tech_pvt->dbg_binary_frames_rx,
+        len, write_bytes, inuse_after, (size_t)MAX_BUFFER);
     }
+    /* WRITE_REPLACE callback handles draining — no direct write here */
   }
 
 }
