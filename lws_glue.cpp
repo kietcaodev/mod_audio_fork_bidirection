@@ -388,9 +388,9 @@ namespace {
           NULL,
           switch_core_session_get_pool(session)) == SWITCH_STATUS_SUCCESS) {
       tech_pvt->playback_codec_ready = 1;
-      tech_pvt->playback_direct_mode = 0;  /* force WRITE_REPLACE — paced by FS media timer */
+      tech_pvt->playback_direct_mode = 1;  /* parked calls need direct writes; WRITE_REPLACE does not drain while parked */
       switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
-        "(%u) playback WRITE_REPLACE mode armed: channel_rate=%d frame_bytes=%d\n",
+        "(%u) playback direct mode armed: channel_rate=%d frame_bytes=%d\n",
         tech_pvt->id, tech_pvt->playback_channel_rate, tech_pvt->playback_frame_bytes);
     } else {
       switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING,
@@ -852,7 +852,9 @@ extern "C" {
         tech_pvt->id, tech_pvt->dbg_binary_frames_rx,
         len, write_bytes, inuse_after, (size_t)MAX_BUFFER);
     }
-    /* WRITE_REPLACE callback handles draining — no direct write here */
+    if (tech_pvt->playback_direct_mode && session) {
+      write_playback_frames_direct(tech_pvt, session);
+    }
   }
 
 }
