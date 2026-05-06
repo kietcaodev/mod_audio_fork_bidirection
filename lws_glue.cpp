@@ -845,13 +845,6 @@ extern "C" {
     switch_mutex_unlock(tech_pvt->playback_mutex);
 
     tech_pvt->dbg_binary_frames_rx++;
-    /* Log first frame + every 50th to confirm steady-state flow without spamming */
-    if (tech_pvt->dbg_binary_frames_rx == 1 || tech_pvt->dbg_binary_frames_rx % 50 == 0) {
-      switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO,
-        "(%u) [MOD-BINARY] rx_frame=#%u in=%zuB out=%zuB buf_inuse=%zu/%zu\n",
-        tech_pvt->id, tech_pvt->dbg_binary_frames_rx,
-        len, write_bytes, inuse_after, (size_t)MAX_BUFFER);
-    }
     if (tech_pvt->playback_direct_mode && session) {
       write_playback_frames_direct(tech_pvt, session);
     }
