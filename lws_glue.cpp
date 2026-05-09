@@ -663,6 +663,18 @@ extern "C" {
     if (pAudioPipe && text) pAudioPipe->bufferForSending(text);
     if (pAudioPipe) pAudioPipe->close();
 
+    if (tech_pvt->dbg_binary_frames_rx > 0) {
+      switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
+        "(%u) [MOD-BINARY-SUMMARY] rx=%u bad_frame_size=%u direct_slow_writes=%u input_rate=%d channel_rate=%d frame_bytes=%d\n",
+        id,
+        tech_pvt->dbg_binary_frames_rx,
+        tech_pvt->dbg_binary_bad_frame_size,
+        tech_pvt->dbg_direct_slow_writes,
+        tech_pvt->playback_input_rate,
+        tech_pvt->playback_channel_rate,
+        tech_pvt->playback_frame_bytes);
+    }
+
     destroy_tech_pvt(tech_pvt);
     switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, "(%u) fork_session_cleanup: connection closed\n", id);
     return SWITCH_STATUS_SUCCESS;
@@ -873,7 +885,7 @@ extern "C" {
     switch_mutex_unlock(tech_pvt->playback_mutex);
 
     tech_pvt->dbg_binary_frames_rx++;
-    if (tech_pvt->dbg_binary_frames_rx == 1 || tech_pvt->dbg_binary_frames_rx % 250 == 0) {
+    if (tech_pvt->dbg_binary_frames_rx == 1 || tech_pvt->dbg_binary_frames_rx % 1000 == 0) {
       switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
         "(%u) [MOD-BINARY] rx=%u write_bytes=%zu inuse_before=%zu inuse_after=%zu max_buffer=%zu\n",
         tech_pvt->id, tech_pvt->dbg_binary_frames_rx, write_bytes, inuse, inuse_after, MAX_BUFFER);
