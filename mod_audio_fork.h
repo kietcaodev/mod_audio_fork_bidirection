@@ -54,11 +54,11 @@ struct private_data {
   char initialMetadata[8192];
 
   /* ── Binary playback (realtime audio mode) ─────────────────────────────── */
-  switch_buffer_t   *playback_buffer;       /* ring buffer holding channel-rate PCM ready to inject */
+  switch_buffer_t   *playback_buffer;       /* tiny jitter buffer holding channel-rate PCM ready to inject */
   switch_mutex_t    *playback_mutex;        /* protects playback_buffer */
-  SpeexResamplerState *playback_resampler;  /* lazy-init: resample 16kHz inbound -> channel native rate */
+  SpeexResamplerState *playback_resampler;  /* lazy-init: resample inbound PCM -> channel native rate */
   switch_codec_t    playback_codec;         /* L16 codec used for direct caller playback */
-  int  playback_input_rate;                 /* sample rate arriving from WS (default 16000) */
+  int  playback_input_rate;                 /* sample rate arriving from WS (default 8000, overridden by enableBinaryPlayback) */
   int  playback_channel_rate;               /* native channel rate (8000 for G.711, 16000 for wideband) */
   int  playback_frame_bytes;                /* one outbound packet in decoded linear bytes */
   int  playback_active:1;                   /* 1 after enableBinaryPlayback received */
@@ -68,6 +68,8 @@ struct private_data {
   int  playback_logged_write_replace_skip:1;
   /* ── Debug counters ────────────────────────────────────────────────────── */
   uint32_t dbg_binary_frames_rx;           /* total binary frames received from WS */
+  uint32_t dbg_binary_bad_frame_size;      /* binary frames that do not match one channel packet */
+  uint32_t dbg_direct_slow_writes;         /* direct writes slower than app-paced frame interval */
   uint32_t dbg_wr_frames_full;             /* WRITE_REPLACE: full frames sent */
   uint32_t dbg_wr_frames_partial;          /* WRITE_REPLACE: partial (silence-padded) frames */
   uint32_t dbg_wr_frames_underrun;         /* WRITE_REPLACE: empty buffer (silence kept) */
