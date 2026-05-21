@@ -65,16 +65,30 @@ static switch_bool_t capture_callback(switch_media_bug_t *bug, void *user_data, 
 			size_t available = switch_buffer_inuse(tech_pvt->playback_buffer);
 			size_t needed    = frame->datalen;
 			if (available >= needed) {
+				/* Track high-water mark and alert on buffer backlog > 10 frames (200ms) */
+				if (available > tech_pvt->dbg_buf_hwm_bytes)
+					tech_pvt->dbg_buf_hwm_bytes = (uint32_t)available;
+				if (available > 10 * needed) {
+					tech_pvt->dbg_buf_oversize_events++;
+					if (tech_pvt->dbg_buf_oversize_events == 1 || tech_pvt->dbg_buf_oversize_events % 25 == 0) {
+						switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING,
+							"(%u) [MOD-WR-BACKLOG] #%u buf_before=%zu needed=%zu depth_frames=%.1f hwm=%u\n",
+							tech_pvt->id, tech_pvt->dbg_buf_oversize_events,
+							available, needed, (double)available / (double)needed,
+							tech_pvt->dbg_buf_hwm_bytes);
+					}
+				}
 				switch_buffer_read(tech_pvt->playback_buffer, frame->data, needed);
 				switch_core_media_bug_set_write_replace_frame(bug, frame);
 				tech_pvt->dbg_wr_frames_full++;
-				/* Log first frame + every 50th */
-				if (tech_pvt->dbg_wr_frames_full == 1 || tech_pvt->dbg_wr_frames_full % 50 == 0) {
+				/* Log first frame + every 100th */
+				if (tech_pvt->dbg_wr_frames_full == 1 || tech_pvt->dbg_wr_frames_full % 100 == 0) {
 					switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
-						"(%u) [MOD-WR] full #%u needed=%zu avail_before=%zu avail_after=%zu\n",
+						"(%u) [MOD-WR] full #%u needed=%zu avail_before=%zu avail_after=%zu hwm=%u\n",
 						tech_pvt->id, tech_pvt->dbg_wr_frames_full,
 						needed, available,
-						switch_buffer_inuse(tech_pvt->playback_buffer));
+						switch_buffer_inuse(tech_pvt->playback_buffer),
+						tech_pvt->dbg_buf_hwm_bytes);
 				}
 			} else if (available > 0) {
 				/* Partial fill: silence-pad the remainder */

@@ -73,6 +73,8 @@ struct private_data {
   uint32_t dbg_wr_frames_full;             /* WRITE_REPLACE: full frames sent */
   uint32_t dbg_wr_frames_partial;          /* WRITE_REPLACE: partial (silence-padded) frames */
   uint32_t dbg_wr_frames_underrun;         /* WRITE_REPLACE: empty buffer (silence kept) */
+  uint32_t dbg_buf_hwm_bytes;              /* high-water mark of playback_buffer occupancy */
+  uint32_t dbg_buf_oversize_events;        /* times buffer exceeded 10-frame threshold (200ms) */
   /* ────────────────────────────────────────────────────────────────────────── */
 };
 
