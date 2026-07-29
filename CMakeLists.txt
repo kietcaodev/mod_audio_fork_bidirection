@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.18)
 project(mod_audio_fork
-        VERSION 1.0.0
+        VERSION 1.0.3
         DESCRIPTION "Audio fork module for FreeSWITCH."
         HOMEPAGE_URL "https://github.com/mdslaney/drachtio-freeswitch-modules")
 

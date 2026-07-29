@@ -7,6 +7,11 @@
 
 #include <unistd.h>
 
+/* Bump on every change that gets deployed, so a reload proves which build is
+ * actually loaded. FreeSWITCH reports "+OK module loaded" even when it kept the
+ * previous .so, so the version line in the log is the only reliable check. */
+#define MOD_AUDIO_FORK_VERSION "1.0.3"
+
 #define MY_BUG_NAME "audio_fork"
 #define MAX_BUG_LEN (64)
 #define MAX_SESSION_ID (256)
@@ -64,7 +69,6 @@ struct private_data {
   int  playback_active:1;                   /* 1 after enableBinaryPlayback received */
   int  playback_direct_mode:1;              /* 1 when direct switch_core_session_write_frame is active */
   int  playback_codec_ready:1;              /* L16 playback codec initialized */
-  int  playback_logged_first_direct_write:1;
 
   /* ── Dedicated playback writer thread ──────────────────────────────────────
    * switch_core_session_write_frame() blocks for a full RTP frame interval
@@ -81,15 +85,17 @@ struct private_data {
    * thread writes the playback_* bitfields above, and sharing one storage unit
    * across threads makes those read-modify-writes race. */
   int  playback_thread_stop;                /* set by cleanup, polled by the writer */
-  /* ── Debug counters ────────────────────────────────────────────────────── */
+  /* ── Per-session counters, reported once in [MOD-BINARY-SUMMARY] ─────────
+   * Kept in production: one line per call is cheap and it is the only record
+   * of audio quality (frames dropped, how deep the jitter buffer had to go)
+   * after the call is gone. */
   uint32_t dbg_binary_frames_rx;           /* total binary frames received from WS */
   uint32_t dbg_binary_bad_frame_size;      /* binary frames that do not match one channel packet */
-  uint32_t dbg_direct_slow_writes;         /* direct writes slower than app-paced frame interval */
-  uint32_t dbg_direct_frames;              /* direct playback frames written */
+  uint32_t dbg_direct_slow_writes;         /* writes that blocked longer than 30ms */
+  uint32_t dbg_direct_frames;              /* playback frames written to the channel */
   uint64_t dbg_direct_write_us;            /* cumulative us spent in switch_core_session_write_frame */
-  unsigned long dbg_lws_thread_hash;       /* id of the thread doing this session's playback writes */
-  uint32_t dbg_playback_hwm_bytes;          /* deepest the playback jitter buffer ever got */
-  uint32_t dbg_playback_overflow_frames;    /* frames dropped because that buffer was full */
+  uint32_t dbg_playback_hwm_bytes;         /* deepest the playback jitter buffer ever got */
+  uint32_t dbg_playback_overflow_frames;   /* frames dropped because that buffer was full */
   /* ────────────────────────────────────────────────────────────────────────── */
 };
 

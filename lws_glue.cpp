@@ -24,9 +24,6 @@ extern "C" void fork_session_handle_binary(private_t *tech_pvt, switch_core_sess
 
 #define RTP_PACKETIZATION_PERIOD 20
 #define FRAME_SIZE_8000  320 /* 20ms frame: 320 bytes at 8kHz PCM16 mono */
-/* How often each session prints its [MOD-BINARY] progress line, in 20ms frames.
- * 1500 == every 30s, so a 50-call load test stays under 2 lines/sec. */
-#define BINARY_LOG_EVERY_FRAMES 1500
 
 namespace {
   static const char *requestedBufferSecs = std::getenv("MOD_AUDIO_FORK_BUFFER_SECS");
@@ -89,10 +86,6 @@ namespace {
       switch_time_t write_start = switch_micro_time_now();
       switch_status_t status = switch_core_session_write_frame(session, &frame, SWITCH_IO_FLAG_NONE, 0);
       switch_time_t write_elapsed_us = switch_micro_time_now() - write_start;
-      /* Attributed to whichever thread called us. This now runs on the
-       * per-session writer thread, so the lws service thread's report should
-       * show session_write_frame=0% -- that is the fix working. */
-      AudioPipe::addForeignWriteUs((uint64_t) write_elapsed_us);
       tech_pvt->dbg_direct_write_us += (uint64_t) write_elapsed_us;
       tech_pvt->dbg_direct_frames++;
       if (status != SWITCH_STATUS_SUCCESS) {
@@ -103,27 +96,10 @@ namespace {
       }
       frames_written++;
 
-      if (write_elapsed_us > 30000) {
-        tech_pvt->dbg_direct_slow_writes++;
-        if (tech_pvt->dbg_direct_slow_writes == 1 || tech_pvt->dbg_direct_slow_writes % 20 == 0) {
-          switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING,
-            "(%u) [MOD-DIRECT-SLOW] #%u write_elapsed_ms=%lld frame_bytes=%zu\n",
-            tech_pvt->id, tech_pvt->dbg_direct_slow_writes,
-            (long long)(write_elapsed_us / 1000), bytes_read);
-        }
-      }
-
-      if (!tech_pvt->playback_logged_first_direct_write) {
-        tech_pvt->playback_logged_first_direct_write = 1;
-        /* Log which thread we are on. Every session must print a DIFFERENT
-         * hash now -- a shared hash would mean writes are serialized again. */
-        tech_pvt->dbg_lws_thread_hash =
-          (unsigned long) std::hash<std::thread::id>()(std::this_thread::get_id());
-        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
-          "(%u) direct playback write active: frame_bytes=%d channel_rate=%d lws_thread=%lx\n",
-          tech_pvt->id, tech_pvt->playback_frame_bytes, tech_pvt->playback_channel_rate,
-          tech_pvt->dbg_lws_thread_hash);
-      }
+      /* Counted, not logged: a write taking longer than a couple of frame
+       * intervals is expected under load and the per-event warning was pure
+       * noise at 50 calls. The total lands in [MOD-BINARY-SUMMARY]. */
+      if (write_elapsed_us > 30000) tech_pvt->dbg_direct_slow_writes++;
     }
 
     return frames_written > 0 ? SWITCH_STATUS_SUCCESS : SWITCH_STATUS_FALSE;
@@ -140,7 +116,7 @@ namespace {
     private_t *tech_pvt = (private_t *) obj;
     switch_core_session_t *session = tech_pvt->session;
 
-    switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
+    switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG,
       "(%u) playback writer thread started\n", tech_pvt->id);
 
     while (!tech_pvt->playback_thread_stop) {
@@ -163,10 +139,8 @@ namespace {
       }
     }
 
-    switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
-      "(%u) playback writer thread ended: frames=%u write_ms=%llu\n",
-      tech_pvt->id, tech_pvt->dbg_direct_frames,
-      (unsigned long long)(tech_pvt->dbg_direct_write_us / 1000));
+    /* Nothing logged on exit: the same figures are in [MOD-BINARY-SUMMARY],
+     * which fires once per session in fork_session_cleanup. */
     return NULL;
   }
 
@@ -368,12 +342,7 @@ namespace {
   }
 
   static void eventCallback(const char* sessionId, const char* bugname, AudioPipe::NotifyEvent_t event, const char* message) {
-    /* Runs on the lws service thread. locate() takes the global session hash
-     * lock plus the session read lock, and we do it on every binary frame
-     * (50/s per session), so time it separately from the playback write. */
-    switch_time_t locate_start = switch_micro_time_now();
     switch_core_session_t* session = switch_core_session_locate(sessionId);
-    AudioPipe::addForeignLocateUs((uint64_t)(switch_micro_time_now() - locate_start));
     if (session) {
       switch_channel_t *channel = switch_core_session_get_channel(session);
       switch_media_bug_t *bug = (switch_media_bug_t*) switch_channel_get_private(channel, bugname);
@@ -482,7 +451,6 @@ namespace {
       (uint8_t *) switch_core_session_alloc(session, (size_t) tech_pvt->playback_frame_bytes) : nullptr;
     tech_pvt->playback_direct_mode  = 0;
     tech_pvt->playback_codec_ready  = 0;
-    tech_pvt->playback_logged_first_direct_write = 0;
     switch_mutex_init(&tech_pvt->playback_mutex, SWITCH_MUTEX_NESTED,
       switch_core_session_get_pool(session));
     /* Tiny jitter buffer only. Backend/app owns realtime pacing. */
@@ -502,7 +470,7 @@ namespace {
       tech_pvt->playback_codec_ready = 1;
       tech_pvt->playback_direct_mode = 1;  /* playback path armed; the writer thread owns it */
       start_playback_writer(tech_pvt, session);
-      switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
+      switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG,
         "(%u) playback direct mode armed: channel_rate=%d frame_bytes=%d\n",
         tech_pvt->id, tech_pvt->playback_channel_rate, tech_pvt->playback_frame_bytes);
     } else {
@@ -668,6 +636,7 @@ extern "C" {
   }
 
   switch_status_t fork_init() {
+    switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "mod_audio_fork: version:                   %s\n", MOD_AUDIO_FORK_VERSION);
     switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "mod_audio_fork: audio buffer (in secs):    %d secs\n", nAudioBufferSecs);
     switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "mod_audio_fork: sub-protocol:              %s\n", mySubProtocolName);
     switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "mod_audio_fork: lws service threads:       %d\n", nServiceThreads);
@@ -779,7 +748,7 @@ extern "C" {
       switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
         "(%u) [MOD-BINARY-SUMMARY] rx=%u bad_frame_size=%u direct_slow_writes=%u input_rate=%d channel_rate=%d frame_bytes=%d "
         "playback_hwm=%u playback_overflow_frames=%u "
-        "direct_frames=%u direct_write_ms=%llu avg_write_us=%llu lws_thread=%lx uplink_flushes=%u uplink_queues=%u uplink_kb=%llu\n",
+        "direct_frames=%u direct_write_ms=%llu avg_write_us=%llu uplink_flushes=%u uplink_queues=%u uplink_kb=%llu\n",
         id,
         tech_pvt->dbg_binary_frames_rx,
         tech_pvt->dbg_binary_bad_frame_size,
@@ -793,7 +762,6 @@ extern "C" {
         (unsigned long long)(tech_pvt->dbg_direct_write_us / 1000),
         (unsigned long long)(tech_pvt->dbg_direct_frames ?
           tech_pvt->dbg_direct_write_us / tech_pvt->dbg_direct_frames : 0),
-        tech_pvt->dbg_lws_thread_hash,
         uplinkFlushes, uplinkQueues, (unsigned long long) uplinkKb);
     }
 
@@ -978,10 +946,11 @@ extern "C" {
   }
 
   /* ── fork_session_handle_binary ───────────────────────────────────────────
-   * Called from eventCallback when a BINARY_AUDIO event fires.
-  * Resamples inbound PCM (playback_input_rate → playback_channel_rate),
-  * writes the result into a tiny per-session jitter buffer, then writes at most
-  * one channel frame in direct mode. Backend/app owns 20ms realtime pacing.
+   * Called from eventCallback when a BINARY_AUDIO event fires, on the shared
+   * lws service thread. Resamples inbound PCM (playback_input_rate ->
+   * playback_channel_rate) into the per-session jitter buffer and returns
+   * immediately. The session's own writer thread drains it and does the
+   * blocking write to the channel.
    * ─────────────────────────────────────────────────────────────────────── */
   void fork_session_handle_binary(private_t *tech_pvt, switch_core_session_t *session, const uint8_t *data, size_t len) {
     if (!tech_pvt || !tech_pvt->playback_active || !tech_pvt->playback_buffer || !data || len == 0)
@@ -1042,22 +1011,9 @@ extern "C" {
       }
     }
     switch_buffer_write(tech_pvt->playback_buffer, write_ptr, write_bytes);
-    size_t inuse_after = switch_buffer_inuse(tech_pvt->playback_buffer);
     switch_mutex_unlock(tech_pvt->playback_mutex);
 
     tech_pvt->dbg_binary_frames_rx++;
-    if (tech_pvt->dbg_binary_frames_rx == 1 ||
-        tech_pvt->dbg_binary_frames_rx % BINARY_LOG_EVERY_FRAMES == 0) {
-      switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
-        "(%u) [MOD-BINARY] rx=%u write_bytes=%zu inuse_before=%zu inuse_after=%zu max_buffer=%zu "
-        "hwm=%u overflow_frames=%u direct_frames=%u direct_write_ms=%llu avg_write_us=%llu\n",
-        tech_pvt->id, tech_pvt->dbg_binary_frames_rx, write_bytes, inuse, inuse_after, MAX_BUFFER,
-        tech_pvt->dbg_playback_hwm_bytes, tech_pvt->dbg_playback_overflow_frames,
-        tech_pvt->dbg_direct_frames,
-        (unsigned long long)(tech_pvt->dbg_direct_write_us / 1000),
-        (unsigned long long)(tech_pvt->dbg_direct_frames ?
-          tech_pvt->dbg_direct_write_us / tech_pvt->dbg_direct_frames : 0));
-    }
     /* Deliberately no write_frame here: this runs on the shared lws service
      * thread. The per-session playback writer thread picks the data up. */
   }

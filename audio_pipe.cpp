@@ -3,14 +3,10 @@
 #include <cassert>
 #include <iostream>
 #include <chrono>
-#include <time.h>
 
 /* discard incoming text messages over the socket that are longer than this */
 #define MAX_RECV_BUF_SIZE (65 * 1024 * 10)
 #define RECV_BUF_REALLOC_SIZE (8 * 1024)
-
-/* how often each service thread emits its occupancy summary */
-#define THREAD_STATS_INTERVAL_US (2 * 1000000)
 
 namespace {
   static const char* basicAuthUser = std::getenv("MOD_AUDIO_FORK_HTTP_AUTH_USER");
@@ -18,35 +14,6 @@ namespace {
 
   static const char *requestedTcpKeepaliveSecs = std::getenv("MOD_AUDIO_FORK_TCP_KEEPALIVE_SECS");
   static int nTcpKeepaliveSecs = requestedTcpKeepaliveSecs ? ::atoi(requestedTcpKeepaliveSecs) : 55;
-
-  /* ── Per-service-thread occupancy counters ──────────────────────────────
-   * All of these live in the lws service thread, so plain thread_local
-   * scalars are enough — no atomics, no locking on the hot path.
-   * The point is to answer one question: what fraction of the service
-   * thread's wall clock is spent inside callbacks (and specifically inside
-   * the session write_frame calls that playback makes), because whatever is
-   * left over is all the thread has to flush uplink audio with. */
-  thread_local uint64_t tl_cb_us = 0;          /* total time inside lws_callback */
-  thread_local uint64_t tl_cb_binary_us = 0;   /* subset: BINARY_AUDIO callbacks */
-  thread_local uint64_t tl_cb_writeable_us = 0;/* subset: CLIENT_WRITEABLE callbacks */
-  thread_local uint64_t tl_foreign_write_us = 0;/* subset: switch_core_session_write_frame */
-  thread_local uint64_t tl_foreign_locate_us = 0;/* subset: switch_core_session_locate */
-  thread_local uint32_t tl_cb_count = 0;
-  thread_local uint32_t tl_cb_binary_count = 0;
-  thread_local uint32_t tl_cb_writeable_count = 0;
-  thread_local uint64_t tl_cb_worst_us = 0;
-  thread_local int      tl_cb_worst_reason = -1;
-
-  /* Actual CPU burned by this thread, as opposed to wall time spent in
-   * callbacks. cb% only covers time inside lws_callback, so a thread pegged
-   * at 100% inside lws_service()'s own poll/bookkeeping looks idle by that
-   * measure. top showed one freeswitch thread at 99.9% of a core; this is how
-   * we tell whether that thread is ours. */
-  static uint64_t threadCpuUs(void) {
-    struct timespec ts;
-    if (0 != clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts)) return 0;
-    return (uint64_t) ts.tv_sec * 1000000ULL + (uint64_t)(ts.tv_nsec / 1000);
-  }
 }
 
 // remove once we update to lws with this helper
@@ -74,40 +41,7 @@ uint64_t AudioPipe::nowUs(void) {
     std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
-void AudioPipe::addForeignWriteUs(uint64_t us) {
-  tl_foreign_write_us += us;
-}
-
-void AudioPipe::addForeignLocateUs(uint64_t us) {
-  tl_foreign_locate_us += us;
-}
-
 int AudioPipe::lws_callback(struct lws *wsi,
-  enum lws_callback_reasons reason,
-  void *user, void *in, size_t len) {
-
-  uint64_t started = nowUs();
-  int rc = lws_callback_impl(wsi, reason, user, in, len);
-  uint64_t elapsed = nowUs() - started;
-
-  tl_cb_us += elapsed;
-  tl_cb_count++;
-  if (elapsed > tl_cb_worst_us) {
-    tl_cb_worst_us = elapsed;
-    tl_cb_worst_reason = (int) reason;
-  }
-  if (reason == LWS_CALLBACK_CLIENT_RECEIVE) {
-    tl_cb_binary_us += elapsed;
-    tl_cb_binary_count++;
-  }
-  else if (reason == LWS_CALLBACK_CLIENT_WRITEABLE) {
-    tl_cb_writeable_us += elapsed;
-    tl_cb_writeable_count++;
-  }
-  return rc;
-}
-
-int AudioPipe::lws_callback_impl(struct lws *wsi,
   enum lws_callback_reasons reason,
   void *user, void *in, size_t len) {
 
@@ -546,54 +480,8 @@ bool AudioPipe::lws_service_thread(unsigned int nServiceThread) {
   }
 
   int n;
-  uint64_t window_start = nowUs();
-  uint64_t cpu_start = threadCpuUs();
-  uint64_t loops = 0;
   do {
     n = lws_service(context, 0);
-    loops++;
-
-    /* Periodic occupancy report. If cb% approaches 100 the thread has no
-     * headroom left to flush uplink audio, which is what starves fork_frame
-     * and shows up as "dropping packets!" on every session at once. */
-    uint64_t nowus = nowUs();
-    uint64_t window = nowus - window_start;
-    if (window >= THREAD_STATS_INTERVAL_US) {
-      size_t nPendingWrites;
-      {
-        std::lock_guard<std::mutex> guard(mutex_writes);
-        nPendingWrites = pendingWrites.size();
-      }
-      uint64_t cpu_us = threadCpuUs() - cpu_start;
-      lwsl_notice("[LWS-THREAD %u] window_ms=%llu cpu=%llums(%llu%%) loops=%llu cb=%llums(%llu%%,n=%u) "
-        "recv=%llums(n=%u) writeable=%llums(n=%u) "
-        "session_write_frame=%llums(%llu%%) session_locate=%llums(%llu%%) "
-        "worst_cb=%lluus(reason=%d) pending_writes=%zu\n",
-        nServiceThread,
-        (unsigned long long)(window / 1000),
-        (unsigned long long)(cpu_us / 1000),
-        (unsigned long long)(cpu_us * 100 / window),
-        (unsigned long long) loops,
-        (unsigned long long)(tl_cb_us / 1000),
-        (unsigned long long)(tl_cb_us * 100 / window), tl_cb_count,
-        (unsigned long long)(tl_cb_binary_us / 1000), tl_cb_binary_count,
-        (unsigned long long)(tl_cb_writeable_us / 1000), tl_cb_writeable_count,
-        (unsigned long long)(tl_foreign_write_us / 1000),
-        (unsigned long long)(tl_foreign_write_us * 100 / window),
-        (unsigned long long)(tl_foreign_locate_us / 1000),
-        (unsigned long long)(tl_foreign_locate_us * 100 / window),
-        (unsigned long long) tl_cb_worst_us, tl_cb_worst_reason,
-        nPendingWrites);
-
-      tl_cb_us = tl_cb_binary_us = tl_cb_writeable_us = 0;
-      tl_foreign_write_us = tl_foreign_locate_us = 0;
-      tl_cb_count = tl_cb_binary_count = tl_cb_writeable_count = 0;
-      tl_cb_worst_us = 0;
-      tl_cb_worst_reason = -1;
-      loops = 0;
-      window_start = nowus;
-      cpu_start = threadCpuUs();
-    }
   } while (n >= 0 && !stopping);
 
   /* This thread created the context, so this thread destroys it. Destroying it

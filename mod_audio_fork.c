@@ -301,7 +301,7 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_audio_fork_load)
 {
 	switch_api_interface_t *api_interface;
 
-	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "mod_audio_fork API loading..\n");
+	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "mod_audio_fork v%s API loading..\n", MOD_AUDIO_FORK_VERSION);
 
 	/* connect my internal structure to the blank pointer passed to me */
 	*module_interface = switch_loadable_module_create_module_interface(pool, modname);
@@ -325,7 +325,7 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_audio_fork_load)
 
 	fork_init();
 
-	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "mod_audio_fork API successfully loaded\n");
+	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "mod_audio_fork v%s API successfully loaded\n", MOD_AUDIO_FORK_VERSION);
 
 	/* indicate that the module should continue to be loaded */
   //mod_running = 1;
