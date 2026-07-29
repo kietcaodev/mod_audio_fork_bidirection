@@ -24,7 +24,6 @@ extern "C" void fork_session_handle_binary(private_t *tech_pvt, switch_core_sess
 
 #define RTP_PACKETIZATION_PERIOD 20
 #define FRAME_SIZE_8000  320 /* 20ms frame: 320 bytes at 8kHz PCM16 mono */
-#define PLAYBACK_JITTER_FRAMES 5
 /* How often each session prints its [MOD-BINARY] progress line, in 20ms frames.
  * 1500 == every 30s, so a 50-call load test stays under 2 lines/sec. */
 #define BINARY_LOG_EVERY_FRAMES 1500
@@ -36,6 +35,17 @@ namespace {
   static const char* mySubProtocolName = std::getenv("MOD_AUDIO_FORK_SUBPROTOCOL_NAME") ?
     std::getenv("MOD_AUDIO_FORK_SUBPROTOCOL_NAME") : "audio.drachtio.org";
   static unsigned int nServiceThreads = std::max(1, std::min(requestedNumServiceThreads ? ::atoi(requestedNumServiceThreads) : 1, 5));
+
+  /* Depth of the per-session playback jitter buffer, in 20ms frames.
+   * switch_core_session_write_frame() occasionally blocks for two frame
+   * intervals instead of one, which at 5 frames (100ms) was enough to overflow
+   * and drop audio the backend had already sent. The buffer sits near-empty in
+   * steady state, so extra depth costs no latency until a burst actually needs
+   * it -- but note that once depth accumulates the writer only drains at
+   * realtime, so it persists until the utterance ends or a flush arrives. */
+  static const char *requestedJitterFrames = std::getenv("MOD_AUDIO_FORK_PLAYBACK_JITTER_FRAMES");
+  static int nPlaybackJitterFrames =
+    std::max(3, std::min(requestedJitterFrames ? ::atoi(requestedJitterFrames) : 10, 50));
   static unsigned int idxCallCount = 0;
   static uint32_t playCount = 0;
 
@@ -660,6 +670,8 @@ extern "C" {
     switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "mod_audio_fork: audio buffer (in secs):    %d secs\n", nAudioBufferSecs);
     switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "mod_audio_fork: sub-protocol:              %s\n", mySubProtocolName);
     switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "mod_audio_fork: lws service threads:       %d\n", nServiceThreads);
+    switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "mod_audio_fork: playback jitter frames:    %d (%d ms)\n",
+      nPlaybackJitterFrames, nPlaybackJitterFrames * RTP_PACKETIZATION_PERIOD);
  
     int logs = LLL_ERR | LLL_WARN | LLL_NOTICE ;
      //LLL_INFO | LLL_PARSER | LLL_HEADER | LLL_EXT | LLL_CLIENT  | LLL_LATENCY | LLL_DEBUG ;
@@ -765,6 +777,7 @@ extern "C" {
     if (tech_pvt->dbg_binary_frames_rx > 0) {
       switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
         "(%u) [MOD-BINARY-SUMMARY] rx=%u bad_frame_size=%u direct_slow_writes=%u input_rate=%d channel_rate=%d frame_bytes=%d "
+        "playback_hwm=%u playback_overflow_frames=%u "
         "direct_frames=%u direct_write_ms=%llu avg_write_us=%llu lws_thread=%lx uplink_flushes=%u uplink_queues=%u uplink_kb=%llu\n",
         id,
         tech_pvt->dbg_binary_frames_rx,
@@ -773,6 +786,8 @@ extern "C" {
         tech_pvt->playback_input_rate,
         tech_pvt->playback_channel_rate,
         tech_pvt->playback_frame_bytes,
+        tech_pvt->dbg_playback_hwm_bytes,
+        tech_pvt->dbg_playback_overflow_frames,
         tech_pvt->dbg_direct_frames,
         (unsigned long long)(tech_pvt->dbg_direct_write_us / 1000),
         (unsigned long long)(tech_pvt->dbg_direct_frames ?
@@ -991,9 +1006,8 @@ extern "C" {
     if (write_samples == 0) return;
 
     size_t write_bytes = write_samples * 2;
-    const size_t MAX_BUFFER = tech_pvt->playback_frame_bytes > 0
-      ? (size_t)tech_pvt->playback_frame_bytes * PLAYBACK_JITTER_FRAMES
-      : FRAME_SIZE_8000 * PLAYBACK_JITTER_FRAMES;
+    const size_t MAX_BUFFER = (size_t)nPlaybackJitterFrames *
+      (tech_pvt->playback_frame_bytes > 0 ? (size_t)tech_pvt->playback_frame_bytes : FRAME_SIZE_8000);
 
     if (tech_pvt->playback_frame_bytes > 0 && write_bytes != (size_t)tech_pvt->playback_frame_bytes) {
       tech_pvt->dbg_binary_bad_frame_size++;
@@ -1008,14 +1022,23 @@ extern "C" {
 
     switch_mutex_lock(tech_pvt->playback_mutex);
     size_t inuse = switch_buffer_inuse(tech_pvt->playback_buffer);
+    if (inuse > tech_pvt->dbg_playback_hwm_bytes)
+      tech_pvt->dbg_playback_hwm_bytes = (uint32_t) inuse;
     if (inuse + write_bytes > MAX_BUFFER) {
       /* Overflow: drop oldest data to make room */
       size_t drop = (inuse + write_bytes) - MAX_BUFFER;
       if (drop > inuse) drop = inuse;
       switch_buffer_toss(tech_pvt->playback_buffer, drop);
-      switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
-        "(%u) [MOD-BINARY] OVERFLOW: dropped %zu B | inuse_before=%zu write_bytes=%zu\n",
-        tech_pvt->id, drop, inuse, write_bytes);
+      tech_pvt->dbg_playback_overflow_frames++;
+      /* Rate-limited: one full-buffer episode produces a run of these, and at
+       * 50 sessions the unthrottled version buried everything else. */
+      if (tech_pvt->dbg_playback_overflow_frames == 1 ||
+          tech_pvt->dbg_playback_overflow_frames % 25 == 0) {
+        switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+          "(%u) [MOD-BINARY] OVERFLOW #%u: dropped %zu B | inuse_before=%zu write_bytes=%zu max_buffer=%zu depth_frames=%d\n",
+          tech_pvt->id, tech_pvt->dbg_playback_overflow_frames,
+          drop, inuse, write_bytes, MAX_BUFFER, nPlaybackJitterFrames);
+      }
     }
     switch_buffer_write(tech_pvt->playback_buffer, write_ptr, write_bytes);
     size_t inuse_after = switch_buffer_inuse(tech_pvt->playback_buffer);
@@ -1026,8 +1049,9 @@ extern "C" {
         tech_pvt->dbg_binary_frames_rx % BINARY_LOG_EVERY_FRAMES == 0) {
       switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
         "(%u) [MOD-BINARY] rx=%u write_bytes=%zu inuse_before=%zu inuse_after=%zu max_buffer=%zu "
-        "direct_frames=%u direct_write_ms=%llu avg_write_us=%llu\n",
+        "hwm=%u overflow_frames=%u direct_frames=%u direct_write_ms=%llu avg_write_us=%llu\n",
         tech_pvt->id, tech_pvt->dbg_binary_frames_rx, write_bytes, inuse, inuse_after, MAX_BUFFER,
+        tech_pvt->dbg_playback_hwm_bytes, tech_pvt->dbg_playback_overflow_frames,
         tech_pvt->dbg_direct_frames,
         (unsigned long long)(tech_pvt->dbg_direct_write_us / 1000),
         (unsigned long long)(tech_pvt->dbg_direct_frames ?

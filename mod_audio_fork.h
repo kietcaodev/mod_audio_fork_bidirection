@@ -84,6 +84,8 @@ struct private_data {
   uint32_t dbg_direct_frames;              /* direct playback frames written */
   uint64_t dbg_direct_write_us;            /* cumulative us spent in switch_core_session_write_frame */
   unsigned long dbg_lws_thread_hash;       /* id of the thread doing this session's playback writes */
+  uint32_t dbg_playback_hwm_bytes;          /* deepest the playback jitter buffer ever got */
+  uint32_t dbg_playback_overflow_frames;    /* frames dropped because that buffer was full */
   /* ────────────────────────────────────────────────────────────────────────── */
 };
 
