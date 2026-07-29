@@ -3,6 +3,7 @@
 #include <cassert>
 #include <iostream>
 #include <chrono>
+#include <time.h>
 
 /* discard incoming text messages over the socket that are longer than this */
 #define MAX_RECV_BUF_SIZE (65 * 1024 * 10)
@@ -35,6 +36,17 @@ namespace {
   thread_local uint32_t tl_cb_writeable_count = 0;
   thread_local uint64_t tl_cb_worst_us = 0;
   thread_local int      tl_cb_worst_reason = -1;
+
+  /* Actual CPU burned by this thread, as opposed to wall time spent in
+   * callbacks. cb% only covers time inside lws_callback, so a thread pegged
+   * at 100% inside lws_service()'s own poll/bookkeeping looks idle by that
+   * measure. top showed one freeswitch thread at 99.9% of a core; this is how
+   * we tell whether that thread is ours. */
+  static uint64_t threadCpuUs(void) {
+    struct timespec ts;
+    if (0 != clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts)) return 0;
+    return (uint64_t) ts.tv_sec * 1000000ULL + (uint64_t)(ts.tv_nsec / 1000);
+  }
 }
 
 // remove once we update to lws with this helper
@@ -515,6 +527,7 @@ bool AudioPipe::lws_service_thread(unsigned int nServiceThread) {
 
   int n;
   uint64_t window_start = nowUs();
+  uint64_t cpu_start = threadCpuUs();
   uint64_t loops = 0;
   do {
     n = lws_service(context, 0);
@@ -531,12 +544,15 @@ bool AudioPipe::lws_service_thread(unsigned int nServiceThread) {
         std::lock_guard<std::mutex> guard(mutex_writes);
         nPendingWrites = pendingWrites.size();
       }
-      lwsl_notice("[LWS-THREAD %u] window_ms=%llu loops=%llu cb=%llums(%llu%%,n=%u) "
+      uint64_t cpu_us = threadCpuUs() - cpu_start;
+      lwsl_notice("[LWS-THREAD %u] window_ms=%llu cpu=%llums(%llu%%) loops=%llu cb=%llums(%llu%%,n=%u) "
         "recv=%llums(n=%u) writeable=%llums(n=%u) "
         "session_write_frame=%llums(%llu%%) session_locate=%llums(%llu%%) "
         "worst_cb=%lluus(reason=%d) pending_writes=%zu\n",
         nServiceThread,
         (unsigned long long)(window / 1000),
+        (unsigned long long)(cpu_us / 1000),
+        (unsigned long long)(cpu_us * 100 / window),
         (unsigned long long) loops,
         (unsigned long long)(tl_cb_us / 1000),
         (unsigned long long)(tl_cb_us * 100 / window), tl_cb_count,
@@ -556,6 +572,7 @@ bool AudioPipe::lws_service_thread(unsigned int nServiceThread) {
       tl_cb_worst_reason = -1;
       loops = 0;
       window_start = nowus;
+      cpu_start = threadCpuUs();
     }
   } while (n >= 0 && !stopping);
 
