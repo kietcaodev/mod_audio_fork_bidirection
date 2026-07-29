@@ -45,13 +45,14 @@ namespace {
    * realtime, so it persists until the utterance ends or a flush arrives. */
   static const char *requestedJitterFrames = std::getenv("MOD_AUDIO_FORK_PLAYBACK_JITTER_FRAMES");
   static int nPlaybackJitterFrames =
-    std::max(3, std::min(requestedJitterFrames ? ::atoi(requestedJitterFrames) : 10, 50));
+    std::max(3, std::min(requestedJitterFrames ? ::atoi(requestedJitterFrames) : 15, 50));
   static unsigned int idxCallCount = 0;
   static uint32_t playCount = 0;
 
   static switch_status_t write_playback_frames_direct(private_t *tech_pvt, switch_core_session_t *session, int max_frames) {
     if (!tech_pvt || !session || !tech_pvt->playback_direct_mode || !tech_pvt->playback_codec_ready ||
-        !tech_pvt->playback_buffer || !tech_pvt->playback_mutex || tech_pvt->playback_frame_bytes <= 0) {
+        !tech_pvt->playback_buffer || !tech_pvt->playback_mutex || !tech_pvt->playback_chunk ||
+        tech_pvt->playback_frame_bytes <= 0) {
       return SWITCH_STATUS_FALSE;
     }
 
@@ -60,7 +61,7 @@ namespace {
       return SWITCH_STATUS_FALSE;
     }
 
-    std::vector<uint8_t> chunk((size_t)tech_pvt->playback_frame_bytes);
+    uint8_t *chunk = tech_pvt->playback_chunk;
 
     int frames_written = 0;
     while (max_frames <= 0 || frames_written < max_frames) {
@@ -68,7 +69,7 @@ namespace {
       switch_mutex_lock(tech_pvt->playback_mutex);
       size_t available = switch_buffer_inuse(tech_pvt->playback_buffer);
       if (available >= (size_t)tech_pvt->playback_frame_bytes) {
-        bytes_read = switch_buffer_read(tech_pvt->playback_buffer, chunk.data(), (size_t)tech_pvt->playback_frame_bytes);
+        bytes_read = switch_buffer_read(tech_pvt->playback_buffer, chunk, (size_t)tech_pvt->playback_frame_bytes);
       }
       switch_mutex_unlock(tech_pvt->playback_mutex);
 
@@ -78,7 +79,7 @@ namespace {
 
       switch_frame_t frame = { 0 };
       frame.codec = &tech_pvt->playback_codec;
-      frame.data = chunk.data();
+      frame.data = chunk;
       frame.buflen = (uint32_t)bytes_read;
       frame.datalen = (uint32_t)bytes_read;
       frame.samples = (uint32_t)(bytes_read / sizeof(int16_t));
@@ -154,17 +155,11 @@ namespace {
         continue;
       }
 
-      switch_mutex_lock(tech_pvt->playback_mutex);
-      size_t available = switch_buffer_inuse(tech_pvt->playback_buffer);
-      switch_mutex_unlock(tech_pvt->playback_mutex);
-
-      if (available < (size_t) tech_pvt->playback_frame_bytes) {
-        switch_yield(2000);   /* underrun: let the channel's own audio through */
-        continue;
-      }
-
+      /* No separate "is there data" probe: write_playback_frames_direct already
+       * checks under the lock and reports FALSE when it wrote nothing, so
+       * peeking first only doubled the per-frame locking. */
       if (write_playback_frames_direct(tech_pvt, session, 1) != SWITCH_STATUS_SUCCESS) {
-        switch_yield(2000);
+        switch_yield(2000);   /* underrun: let the channel's own audio through */
       }
     }
 
@@ -479,6 +474,8 @@ namespace {
     tech_pvt->playback_resampler    = nullptr;
     tech_pvt->playback_frame_bytes  = (int) (write_impl.decoded_bytes_per_packet ?
       write_impl.decoded_bytes_per_packet : read_impl.decoded_bytes_per_packet);
+    tech_pvt->playback_chunk        = tech_pvt->playback_frame_bytes > 0 ?
+      (uint8_t *) switch_core_session_alloc(session, (size_t) tech_pvt->playback_frame_bytes) : nullptr;
     tech_pvt->playback_direct_mode  = 0;
     tech_pvt->playback_codec_ready  = 0;
     tech_pvt->playback_logged_first_direct_write = 0;

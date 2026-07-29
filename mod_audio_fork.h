@@ -73,6 +73,10 @@ struct private_data {
    * flush, so each session drains its own jitter buffer on its own thread. */
   switch_core_session_t *session;           /* owning session, for the writer thread */
   switch_thread_t   *playback_thread;       /* NULL when no writer was started */
+  /* Pool-allocated scratch for one outbound frame. Preallocated because the
+   * writer touches it 50x/sec per session; a per-frame heap allocation here was
+   * 10k malloc/free per second at 200 calls. */
+  uint8_t          *playback_chunk;
   /* Not a bitfield on purpose: the session thread sets this while the lws
    * thread writes the playback_* bitfields above, and sharing one storage unit
    * across threads makes those read-modify-writes race. */
