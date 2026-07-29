@@ -75,6 +75,12 @@ namespace {
       switch_time_t write_start = switch_micro_time_now();
       switch_status_t status = switch_core_session_write_frame(session, &frame, SWITCH_IO_FLAG_NONE, 0);
       switch_time_t write_elapsed_us = switch_micro_time_now() - write_start;
+      /* This runs on the lws service thread, so every microsecond spent here is
+       * a microsecond the thread cannot spend flushing uplink audio. Feed it to
+       * the per-thread occupancy report. */
+      AudioPipe::addForeignWriteUs((uint64_t) write_elapsed_us);
+      tech_pvt->dbg_direct_write_us += (uint64_t) write_elapsed_us;
+      tech_pvt->dbg_direct_frames++;
       if (status != SWITCH_STATUS_SUCCESS) {
         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
           "(%u) direct playback write failed: status=%d bytes=%zu\n",
@@ -95,9 +101,14 @@ namespace {
 
       if (!tech_pvt->playback_logged_first_direct_write) {
         tech_pvt->playback_logged_first_direct_write = 1;
+        /* Log which thread we are on: if every session prints the same hash,
+         * all playback writes are serialized through one lws service thread. */
+        tech_pvt->dbg_lws_thread_hash =
+          (unsigned long) std::hash<std::thread::id>()(std::this_thread::get_id());
         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
-          "(%u) direct playback write active: frame_bytes=%d channel_rate=%d\n",
-          tech_pvt->id, tech_pvt->playback_frame_bytes, tech_pvt->playback_channel_rate);
+          "(%u) direct playback write active: frame_bytes=%d channel_rate=%d lws_thread=%lx\n",
+          tech_pvt->id, tech_pvt->playback_frame_bytes, tech_pvt->playback_channel_rate,
+          tech_pvt->dbg_lws_thread_hash);
       }
     }
 
@@ -280,7 +291,12 @@ namespace {
   }
 
   static void eventCallback(const char* sessionId, const char* bugname, AudioPipe::NotifyEvent_t event, const char* message) {
+    /* Runs on the lws service thread. locate() takes the global session hash
+     * lock plus the session read lock, and we do it on every binary frame
+     * (50/s per session), so time it separately from the playback write. */
+    switch_time_t locate_start = switch_micro_time_now();
     switch_core_session_t* session = switch_core_session_locate(sessionId);
+    AudioPipe::addForeignLocateUs((uint64_t)(switch_micro_time_now() - locate_start));
     if (session) {
       switch_channel_t *channel = switch_core_session_get_channel(session);
       switch_media_bug_t *bug = (switch_media_bug_t*) switch_channel_get_private(channel, bugname);
@@ -661,18 +677,32 @@ extern "C" {
     }
 
     if (pAudioPipe && text) pAudioPipe->bufferForSending(text);
+
+    /* Snapshot uplink stats before close(): once closed, the lws thread deletes
+     * the AudioPipe on LWS_CALLBACK_CLIENT_CLOSED and the pointer goes stale. */
+    uint32_t uplinkFlushes = pAudioPipe ? pAudioPipe->getFlushCount() : 0;
+    uint32_t uplinkQueues  = pAudioPipe ? pAudioPipe->getQueueCount() : 0;
+    uint64_t uplinkKb      = pAudioPipe ? pAudioPipe->getFlushedBytes() / 1024 : 0;
+
     if (pAudioPipe) pAudioPipe->close();
 
     if (tech_pvt->dbg_binary_frames_rx > 0) {
       switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
-        "(%u) [MOD-BINARY-SUMMARY] rx=%u bad_frame_size=%u direct_slow_writes=%u input_rate=%d channel_rate=%d frame_bytes=%d\n",
+        "(%u) [MOD-BINARY-SUMMARY] rx=%u bad_frame_size=%u direct_slow_writes=%u input_rate=%d channel_rate=%d frame_bytes=%d "
+        "direct_frames=%u direct_write_ms=%llu avg_write_us=%llu lws_thread=%lx uplink_flushes=%u uplink_queues=%u uplink_kb=%llu\n",
         id,
         tech_pvt->dbg_binary_frames_rx,
         tech_pvt->dbg_binary_bad_frame_size,
         tech_pvt->dbg_direct_slow_writes,
         tech_pvt->playback_input_rate,
         tech_pvt->playback_channel_rate,
-        tech_pvt->playback_frame_bytes);
+        tech_pvt->playback_frame_bytes,
+        tech_pvt->dbg_direct_frames,
+        (unsigned long long)(tech_pvt->dbg_direct_write_us / 1000),
+        (unsigned long long)(tech_pvt->dbg_direct_frames ?
+          tech_pvt->dbg_direct_write_us / tech_pvt->dbg_direct_frames : 0),
+        tech_pvt->dbg_lws_thread_hash,
+        uplinkFlushes, uplinkQueues, (unsigned long long) uplinkKb);
     }
 
     destroy_tech_pvt(tech_pvt);
@@ -764,8 +794,24 @@ extern "C" {
               tech_pvt->buffer_overrun_notified = 1;
               tech_pvt->responseHandler(session, EVENT_BUFFER_OVERRUN, NULL);
             }
-            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "(%u) dropping packets!\n", 
-              tech_pvt->id);
+            /* Report *why* we ran out of room: the buffer only overflows if the
+             * lws service thread stopped flushing it. since_flush_ms growing to
+             * the full buffer depth (nAudioBufferSecs) means zero drain. */
+            uint64_t nowus = AudioPipe::nowUs();
+            uint64_t lastFlush = pAudioPipe->getLastFlushUs();
+            uint64_t lastQueue = pAudioPipe->getLastQueueUs();
+            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
+              "(%u) dropping packets! [MOD-UPLINK-STALL] since_flush_ms=%lld since_queue_ms=%lld "
+              "flushes=%u queues=%u flushed_kb=%llu offset=%zu buf_max=%zu lws_state=%d\n",
+              tech_pvt->id,
+              lastFlush ? (long long)((nowus - lastFlush) / 1000) : -1LL,
+              lastQueue ? (long long)((nowus - lastQueue) / 1000) : -1LL,
+              pAudioPipe->getFlushCount(),
+              pAudioPipe->getQueueCount(),
+              (unsigned long long)(pAudioPipe->getFlushedBytes() / 1024),
+              pAudioPipe->getWriteOffset(),
+              pAudioPipe->getWriteOffset() + available,
+              (int) pAudioPipe->getLwsState());
             pAudioPipe->binaryWritePtrResetToZero();
 
             frame.data = pAudioPipe->binaryWritePtr();
@@ -808,8 +854,15 @@ extern "C" {
             if (available < pAudioPipe->binaryMinSpace()) {
               if (!tech_pvt->buffer_overrun_notified) {
                 tech_pvt->buffer_overrun_notified = 1;
-                switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "(%u) dropping packets!\n", 
-                  tech_pvt->id);
+                uint64_t nowus = AudioPipe::nowUs();
+                uint64_t lastFlush = pAudioPipe->getLastFlushUs();
+                switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
+                  "(%u) dropping packets! [MOD-UPLINK-STALL resampled] since_flush_ms=%lld flushes=%u queues=%u lws_state=%d\n",
+                  tech_pvt->id,
+                  lastFlush ? (long long)((nowus - lastFlush) / 1000) : -1LL,
+                  pAudioPipe->getFlushCount(),
+                  pAudioPipe->getQueueCount(),
+                  (int) pAudioPipe->getLwsState());
                 tech_pvt->responseHandler(session, EVENT_BUFFER_OVERRUN, NULL);
               }
               break;
@@ -885,10 +938,16 @@ extern "C" {
     switch_mutex_unlock(tech_pvt->playback_mutex);
 
     tech_pvt->dbg_binary_frames_rx++;
-    if (tech_pvt->dbg_binary_frames_rx == 1 || tech_pvt->dbg_binary_frames_rx % 1000 == 0) {
+    /* every 250 frames == 5s of 20ms audio, frequent enough to watch a load test */
+    if (tech_pvt->dbg_binary_frames_rx == 1 || tech_pvt->dbg_binary_frames_rx % 250 == 0) {
       switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
-        "(%u) [MOD-BINARY] rx=%u write_bytes=%zu inuse_before=%zu inuse_after=%zu max_buffer=%zu\n",
-        tech_pvt->id, tech_pvt->dbg_binary_frames_rx, write_bytes, inuse, inuse_after, MAX_BUFFER);
+        "(%u) [MOD-BINARY] rx=%u write_bytes=%zu inuse_before=%zu inuse_after=%zu max_buffer=%zu "
+        "direct_frames=%u direct_write_ms=%llu avg_write_us=%llu\n",
+        tech_pvt->id, tech_pvt->dbg_binary_frames_rx, write_bytes, inuse, inuse_after, MAX_BUFFER,
+        tech_pvt->dbg_direct_frames,
+        (unsigned long long)(tech_pvt->dbg_direct_write_us / 1000),
+        (unsigned long long)(tech_pvt->dbg_direct_frames ?
+          tech_pvt->dbg_direct_write_us / tech_pvt->dbg_direct_frames : 0));
     }
     if (tech_pvt->playback_direct_mode && session) {
       write_playback_frames_direct(tech_pvt, session, 1);

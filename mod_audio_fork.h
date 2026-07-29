@@ -70,6 +70,9 @@ struct private_data {
   uint32_t dbg_binary_frames_rx;           /* total binary frames received from WS */
   uint32_t dbg_binary_bad_frame_size;      /* binary frames that do not match one channel packet */
   uint32_t dbg_direct_slow_writes;         /* direct writes slower than app-paced frame interval */
+  uint32_t dbg_direct_frames;              /* direct playback frames written */
+  uint64_t dbg_direct_write_us;            /* cumulative us spent in switch_core_session_write_frame */
+  unsigned long dbg_lws_thread_hash;       /* which lws service thread services this session */
   uint32_t dbg_wr_frames_full;             /* WRITE_REPLACE: full frames sent */
   uint32_t dbg_wr_frames_partial;          /* WRITE_REPLACE: partial (silence-padded) frames */
   uint32_t dbg_wr_frames_underrun;         /* WRITE_REPLACE: empty buffer (silence kept) */

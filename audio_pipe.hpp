@@ -86,6 +86,24 @@ public:
   const uint8_t* getBinaryPayload(void) const { return m_binary_payload; }
   size_t         getBinaryPayloadLen(void) const { return m_binary_payload_len; }
 
+  /* ── Instrumentation: uplink drain evidence ─────────────────────────────
+   * Lets the caller (lws_glue) report, at the moment it drops packets, how
+   * long it has actually been since the lws thread last flushed this pipe. */
+  static uint64_t nowUs(void);
+  uint64_t getLastFlushUs(void) const { return m_stat_last_flush_us; }
+  uint64_t getLastQueueUs(void) const { return m_stat_last_queue_us; }
+  uint32_t getFlushCount(void) const { return m_stat_flush_count; }
+  uint32_t getQueueCount(void) const { return m_stat_queue_count; }
+  uint64_t getFlushedBytes(void) const { return m_stat_flushed_bytes; }
+  size_t   getWriteOffset(void) const { return m_audio_buffer_write_offset; }
+
+  /* Aggregate time the lws service thread spent inside FreeSWITCH calls,
+   * accumulated by lws_glue so the per-thread summary can report it.
+   * Splitting write_frame from session_locate tells us which one, if either,
+   * is eating the thread's budget. */
+  static void addForeignWriteUs(uint64_t us);
+  static void addForeignLocateUs(uint64_t us);
+
   void close() ;
 
   // no default constructor or copying
@@ -95,7 +113,11 @@ public:
 
 private:
 
-  static int lws_callback(struct lws *wsi, enum lws_callback_reasons reason, void *user, void *in, size_t len); 
+  /* lws_callback is a thin timing wrapper so we can measure how much of the
+   * service thread's wall clock is consumed inside callbacks; the real body
+   * lives in lws_callback_impl. */
+  static int lws_callback(struct lws *wsi, enum lws_callback_reasons reason, void *user, void *in, size_t len);
+  static int lws_callback_impl(struct lws *wsi, enum lws_callback_reasons reason, void *user, void *in, size_t len);
   static unsigned int nchild;
   static struct lws_context *contexts[];
   static unsigned int numContexts;
@@ -151,6 +173,13 @@ private:
   /* binary payload scratch — written by lws thread, consumed by eventCallback */
   uint8_t  *m_binary_payload;      /* points into in; only valid during LWS_CALLBACK_CLIENT_RECEIVE */
   size_t    m_binary_payload_len;
+
+  /* instrumentation counters — written by lws thread, read for logging only */
+  uint64_t m_stat_last_flush_us;   /* last successful lws_write of uplink audio */
+  uint64_t m_stat_last_queue_us;   /* last addPendingWrite for uplink audio */
+  uint32_t m_stat_flush_count;
+  uint32_t m_stat_queue_count;
+  uint64_t m_stat_flushed_bytes;
 };
 
 #endif
