@@ -66,6 +66,18 @@ struct private_data {
   int  playback_codec_ready:1;              /* L16 playback codec initialized */
   int  playback_logged_first_direct_write:1;
   int  playback_logged_write_replace_skip:1;
+
+  /* ── Dedicated playback writer thread ──────────────────────────────────────
+   * switch_core_session_write_frame() blocks for a full RTP frame interval
+   * (~20ms) whenever it contends with the channel's own write path. Doing that
+   * on the shared lws service thread starved every other session's uplink
+   * flush, so each session drains its own jitter buffer on its own thread. */
+  switch_core_session_t *session;           /* owning session, for the writer thread */
+  switch_thread_t   *playback_thread;       /* NULL when no writer was started */
+  /* Not a bitfield on purpose: the session thread sets this while the lws
+   * thread writes the playback_* bitfields above, and sharing one storage unit
+   * across threads makes those read-modify-writes race. */
+  int  playback_thread_stop;                /* set by cleanup, polled by the writer */
   /* ── Debug counters ────────────────────────────────────────────────────── */
   uint32_t dbg_binary_frames_rx;           /* total binary frames received from WS */
   uint32_t dbg_binary_bad_frame_size;      /* binary frames that do not match one channel packet */

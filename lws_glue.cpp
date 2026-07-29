@@ -75,9 +75,9 @@ namespace {
       switch_time_t write_start = switch_micro_time_now();
       switch_status_t status = switch_core_session_write_frame(session, &frame, SWITCH_IO_FLAG_NONE, 0);
       switch_time_t write_elapsed_us = switch_micro_time_now() - write_start;
-      /* This runs on the lws service thread, so every microsecond spent here is
-       * a microsecond the thread cannot spend flushing uplink audio. Feed it to
-       * the per-thread occupancy report. */
+      /* Attributed to whichever thread called us. This now runs on the
+       * per-session writer thread, so the lws service thread's report should
+       * show session_write_frame=0% -- that is the fix working. */
       AudioPipe::addForeignWriteUs((uint64_t) write_elapsed_us);
       tech_pvt->dbg_direct_write_us += (uint64_t) write_elapsed_us;
       tech_pvt->dbg_direct_frames++;
@@ -101,8 +101,8 @@ namespace {
 
       if (!tech_pvt->playback_logged_first_direct_write) {
         tech_pvt->playback_logged_first_direct_write = 1;
-        /* Log which thread we are on: if every session prints the same hash,
-         * all playback writes are serialized through one lws service thread. */
+        /* Log which thread we are on. Every session must print a DIFFERENT
+         * hash now -- a shared hash would mean writes are serialized again. */
         tech_pvt->dbg_lws_thread_hash =
           (unsigned long) std::hash<std::thread::id>()(std::this_thread::get_id());
         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
@@ -113,6 +113,71 @@ namespace {
     }
 
     return frames_written > 0 ? SWITCH_STATUS_SUCCESS : SWITCH_STATUS_FALSE;
+  }
+
+  /* ── Playback writer thread ───────────────────────────────────────────────
+   * One per session. Drains playback_buffer into the channel, letting
+   * switch_core_session_write_frame() block for its natural frame interval --
+   * that blocking IS the pacing, it just must not happen on the lws service
+   * thread, which is shared by every session and also has to flush uplink
+   * audio. When the buffer is empty we simply do not write, so the channel's
+   * own audio (file playback, silence) passes through untouched. */
+  static void *SWITCH_THREAD_FUNC playback_writer_thread(switch_thread_t *thread, void *obj) {
+    private_t *tech_pvt = (private_t *) obj;
+    switch_core_session_t *session = tech_pvt->session;
+
+    switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
+      "(%u) playback writer thread started\n", tech_pvt->id);
+
+    while (!tech_pvt->playback_thread_stop) {
+      switch_channel_t *channel = switch_core_session_get_channel(session);
+      /* Exit only once the channel is really gone. A transiently not-ready
+       * channel is handled by write_playback_frames_direct returning FALSE,
+       * which just makes us retry -- we must not quit for good on that. */
+      if (!channel || !switch_channel_up(channel)) break;
+
+      if (!tech_pvt->playback_active || !tech_pvt->playback_buffer) {
+        switch_yield(10000);   /* idle: nothing to play, latency here is free */
+        continue;
+      }
+
+      switch_mutex_lock(tech_pvt->playback_mutex);
+      size_t available = switch_buffer_inuse(tech_pvt->playback_buffer);
+      switch_mutex_unlock(tech_pvt->playback_mutex);
+
+      if (available < (size_t) tech_pvt->playback_frame_bytes) {
+        switch_yield(2000);   /* underrun: let the channel's own audio through */
+        continue;
+      }
+
+      if (write_playback_frames_direct(tech_pvt, session, 1) != SWITCH_STATUS_SUCCESS) {
+        switch_yield(2000);
+      }
+    }
+
+    switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
+      "(%u) playback writer thread ended: frames=%u write_ms=%llu\n",
+      tech_pvt->id, tech_pvt->dbg_direct_frames,
+      (unsigned long long)(tech_pvt->dbg_direct_write_us / 1000));
+    return NULL;
+  }
+
+  static void start_playback_writer(private_t *tech_pvt, switch_core_session_t *session) {
+    switch_threadattr_t *thd_attr = NULL;
+    switch_memory_pool_t *pool = switch_core_session_get_pool(session);
+
+    switch_threadattr_create(&thd_attr, pool);
+    switch_threadattr_detach_set(thd_attr, 0);   /* joinable: cleanup must join before freeing the buffer */
+    switch_threadattr_stacksize_set(thd_attr, SWITCH_THREAD_STACKSIZE);
+    switch_thread_create(&tech_pvt->playback_thread, thd_attr, playback_writer_thread, tech_pvt, pool);
+  }
+
+  static void stop_playback_writer(private_t *tech_pvt) {
+    if (!tech_pvt->playback_thread) return;
+    switch_status_t st = SWITCH_STATUS_SUCCESS;
+    tech_pvt->playback_thread_stop = 1;
+    switch_thread_join(&st, tech_pvt->playback_thread);
+    tech_pvt->playback_thread = NULL;
   }
 
   void processIncomingMessage(private_t* tech_pvt, switch_core_session_t* session, const char* message) {
@@ -391,6 +456,9 @@ namespace {
     if (metadata) strncpy(tech_pvt->initialMetadata, metadata, MAX_METADATA_LEN);
     
     /* ── Init binary playback state ───────────────────────────────────────── */
+    tech_pvt->session               = session;   /* used by the playback writer thread */
+    tech_pvt->playback_thread       = nullptr;
+    tech_pvt->playback_thread_stop  = 0;
     tech_pvt->playback_active       = 0;
     tech_pvt->playback_input_rate   = 8000;    /* backend sends channel-rate PCM in app-paced mode */
     tech_pvt->playback_channel_rate = (int) (write_impl.actual_samples_per_second ?
@@ -420,6 +488,7 @@ namespace {
           switch_core_session_get_pool(session)) == SWITCH_STATUS_SUCCESS) {
       tech_pvt->playback_codec_ready = 1;
       tech_pvt->playback_direct_mode = 1;  /* parked calls need direct writes; WRITE_REPLACE does not drain while parked */
+      start_playback_writer(tech_pvt, session);
       switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
         "(%u) playback direct mode armed: channel_rate=%d frame_bytes=%d\n",
         tech_pvt->id, tech_pvt->playback_channel_rate, tech_pvt->playback_frame_bytes);
@@ -470,8 +539,11 @@ namespace {
       switch_mutex_destroy(tech_pvt->mutex);
       tech_pvt->mutex = nullptr;
     }
-    /* ── Binary playback cleanup ─────────────────────────────────────────── */
+    /* ── Binary playback cleanup ───────────────────────────────────────────
+     * Join the writer thread FIRST: it touches playback_buffer, playback_mutex
+     * and playback_codec, all of which are torn down just below. */
     tech_pvt->playback_active = 0;
+    stop_playback_writer(tech_pvt);
     if (tech_pvt->playback_resampler) {
       speex_resampler_destroy(tech_pvt->playback_resampler);
       tech_pvt->playback_resampler = nullptr;
@@ -949,9 +1021,8 @@ extern "C" {
         (unsigned long long)(tech_pvt->dbg_direct_frames ?
           tech_pvt->dbg_direct_write_us / tech_pvt->dbg_direct_frames : 0));
     }
-    if (tech_pvt->playback_direct_mode && session) {
-      write_playback_frames_direct(tech_pvt, session, 1);
-    }
+    /* Deliberately no write_frame here: this runs on the shared lws service
+     * thread. The per-session playback writer thread picks the data up. */
   }
 
 }
