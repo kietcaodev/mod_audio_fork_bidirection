@@ -144,7 +144,7 @@ int AudioPipe::lws_callback_impl(struct lws *wsi,
     case LWS_CALLBACK_EVENT_WAIT_CANCELLED:
       processPendingConnects(vhd);
       processPendingDisconnects(vhd);
-      processPendingWrites();
+      processPendingWrites(vhd);
       break;
     case LWS_CALLBACK_CLIENT_CONNECTION_ERROR:
       {
@@ -384,33 +384,53 @@ void AudioPipe::processPendingConnects(lws_per_vhost_data *vhd) {
   }
 }
 
+/* Claim only the entries this service thread owns. Anything belonging to
+ * another context is left queued: addPendingWrite/Disconnect already woke that
+ * context with lws_cancel_service(), so its own thread will come and take it.
+ * Entries whose pipe is no longer in the expected state are dropped. */
 void AudioPipe::processPendingDisconnects(lws_per_vhost_data *vhd) {
   std::list<AudioPipe*> disconnects;
   {
     std::lock_guard<std::mutex> guard(mutex_disconnects);
-    for (auto it = pendingDisconnects.begin(); it != pendingDisconnects.end(); ++it) {
-      if ((*it)->m_state == LWS_CLIENT_DISCONNECTING) disconnects.push_back(*it);
+    for (auto it = pendingDisconnects.begin(); it != pendingDisconnects.end(); ) {
+      AudioPipe* ap = *it;
+      if (ap->m_state != LWS_CLIENT_DISCONNECTING) {
+        it = pendingDisconnects.erase(it);
+      }
+      else if (ap->m_vhd == vhd) {
+        disconnects.push_back(ap);
+        it = pendingDisconnects.erase(it);
+      }
+      else {
+        ++it;   /* another context's wsi - not ours to touch */
+      }
     }
-    pendingDisconnects.clear();
   }
   for (auto it = disconnects.begin(); it != disconnects.end(); ++it) {
-    AudioPipe* ap = *it;
-    lws_callback_on_writable(ap->m_wsi); 
+    lws_callback_on_writable((*it)->m_wsi);
   }
 }
 
-void AudioPipe::processPendingWrites() {
+void AudioPipe::processPendingWrites(lws_per_vhost_data *vhd) {
   std::list<AudioPipe*> writes;
   {
     std::lock_guard<std::mutex> guard(mutex_writes);
-    for (auto it = pendingWrites.begin(); it != pendingWrites.end(); ++it) {
-       if ((*it)->m_state == LWS_CLIENT_CONNECTED) writes.push_back(*it);
-    }  
-    pendingWrites.clear();
+    for (auto it = pendingWrites.begin(); it != pendingWrites.end(); ) {
+      AudioPipe* ap = *it;
+      if (ap->m_state != LWS_CLIENT_CONNECTED) {
+        it = pendingWrites.erase(it);
+      }
+      else if (ap->m_vhd == vhd) {
+        writes.push_back(ap);
+        it = pendingWrites.erase(it);
+      }
+      else {
+        ++it;   /* another context's wsi - not ours to touch */
+      }
+    }
   }
   for (auto it = writes.begin(); it != writes.end(); ++it) {
-    AudioPipe* ap = *it;
-    lws_callback_on_writable(ap->m_wsi);
+    lws_callback_on_writable((*it)->m_wsi);
   }
 }
 

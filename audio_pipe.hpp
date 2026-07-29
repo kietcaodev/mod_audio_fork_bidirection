@@ -145,8 +145,12 @@ private:
   static void addPendingDisconnect(AudioPipe* ap);
   static void addPendingWrite(AudioPipe* ap);
   static void processPendingConnects(lws_per_vhost_data *vhd);
+  /* Both take the calling thread's vhd and only touch pipes that belong to it:
+   * lws_callback_on_writable() may only be called from the service thread that
+   * owns the wsi, so with more than one service thread the old
+   * process-everything behaviour was a cross-context race. */
   static void processPendingDisconnects(lws_per_vhost_data *vhd);
-  static void processPendingWrites(void);
+  static void processPendingWrites(lws_per_vhost_data *vhd);
   
   bool connect_client(struct lws_per_vhost_data *vhd);
 
