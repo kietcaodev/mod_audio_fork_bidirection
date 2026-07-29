@@ -10,7 +10,7 @@
 /* Bump on every change that gets deployed, so a reload proves which build is
  * actually loaded. FreeSWITCH reports "+OK module loaded" even when it kept the
  * previous .so, so the version line in the log is the only reliable check. */
-#define MOD_AUDIO_FORK_VERSION "1.0.3"
+#define MOD_AUDIO_FORK_VERSION "1.0.4"
 
 #define MY_BUG_NAME "audio_fork"
 #define MAX_BUG_LEN (64)

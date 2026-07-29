@@ -179,7 +179,15 @@ namespace {
           const char* szAudioContentType = cJSON_GetObjectCstr(jsonData, "audioContentType");
           char fileType[6];
           int sampleRate = 16000;
-          if (0 == strcmp(szAudioContentType, "raw")) {
+          if (!szAudioContentType) {
+            /* Was an unguarded strcmp: a playAudio message without this field
+             * crashed the service thread, taking every other call with it. */
+            validAudio = 0;
+            switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,
+              "(%u) processIncomingMessage - playAudio missing audioContentType\n", tech_pvt->id);
+            strcpy(fileType, ".r16");
+          }
+          else if (0 == strcmp(szAudioContentType, "raw")) {
             cJSON* jsonSR = cJSON_GetObjectItem(jsonData, "sampleRate");
             sampleRate = jsonSR && jsonSR->valueint ? jsonSR->valueint : 0;
 
