@@ -310,7 +310,11 @@ namespace {
           switch_buffer_zero(tech_pvt->playback_buffer);
           switch_mutex_unlock(tech_pvt->playback_mutex);
         }
-        switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO,
+        /* DEBUG, not INFO: these three fire several times per utterance, so at
+         * 50+ concurrent calls they are tens of lines a second of state that
+         * the [MOD-BINARY] counters already summarise. Turn DEBUG on when
+         * tracing a single call. */
+        switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG,
           "(%u) flush: cleared playback buffer\n", tech_pvt->id);
       }
       else if (0 == type.compare("enableBinaryPlayback")) {
@@ -338,7 +342,7 @@ namespace {
           }
         }
         tech_pvt->playback_active = 1;
-        switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO,
+        switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG,
           "(%u) enableBinaryPlayback: active=1 input_rate=%d channel_rate=%d\n",
           tech_pvt->id, tech_pvt->playback_input_rate, tech_pvt->playback_channel_rate);
       }
@@ -349,7 +353,7 @@ namespace {
           switch_buffer_zero(tech_pvt->playback_buffer);
           switch_mutex_unlock(tech_pvt->playback_mutex);
         }
-        switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO,
+        switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG,
           "(%u) disableBinaryPlayback: active=0\n", tech_pvt->id);
       }
       /* ────────────────────────────────────────────────────────────────────── */
