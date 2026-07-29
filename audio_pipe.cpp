@@ -342,7 +342,7 @@ struct lws_context *AudioPipe::contexts[] = {
   nullptr, nullptr, nullptr, nullptr, nullptr
 };
 unsigned int AudioPipe::numContexts = 0;
-unsigned int AudioPipe::nchild = 0;
+std::atomic<unsigned int> AudioPipe::nchild(0);
 std::string AudioPipe::protocolName;
 std::mutex AudioPipe::mutex_connects;
 std::mutex AudioPipe::mutex_disconnects;
@@ -351,9 +351,9 @@ std::list<AudioPipe*> AudioPipe::pendingConnects;
 std::list<AudioPipe*> AudioPipe::pendingDisconnects;
 std::list<AudioPipe*> AudioPipe::pendingWrites;
 AudioPipe::log_emit_function AudioPipe::logger;
-std::mutex AudioPipe::mapMutex;
-std::unordered_map<std::thread::id, bool> AudioPipe::stopFlags;
-std::queue<std::thread::id> AudioPipe::threadIds;
+std::atomic<bool> AudioPipe::stopping(false);
+std::vector<std::thread> AudioPipe::serviceThreads;
+std::mutex AudioPipe::mutex_contexts;
 
 void AudioPipe::processPendingConnects(lws_per_vhost_data *vhd) {
   std::list<AudioPipe*> connects;
@@ -443,19 +443,25 @@ void AudioPipe::addPendingConnect(AudioPipe* ap) {
   {
     std::lock_guard<std::mutex> guard(mutex_connects);
     pendingConnects.push_back(ap);
-    lwsl_notice("%s after adding connect there are %lu pending connects\n", 
+    lwsl_notice("%s after adding connect there are %lu pending connects\n",
       ap->m_uuid.c_str(), pendingConnects.size());
   }
-  lws_cancel_service(contexts[nchild++ % numContexts]);
+  /* Round-robin the wakeup across contexts. Guarded: during shutdown
+   * numContexts drops to 0 (which would divide by zero) and slots go null. */
+  std::lock_guard<std::mutex> lk(mutex_contexts);
+  if (stopping || 0 == numContexts) return;
+  struct lws_context *ctx = contexts[nchild++ % numContexts];
+  if (ctx) lws_cancel_service(ctx);
 }
 void AudioPipe::addPendingDisconnect(AudioPipe* ap) {
   ap->m_state = LWS_CLIENT_DISCONNECTING;
   {
     std::lock_guard<std::mutex> guard(mutex_disconnects);
     pendingDisconnects.push_back(ap);
-    lwsl_notice("%s after adding disconnect there are %lu pending disconnects\n", 
+    lwsl_notice("%s after adding disconnect there are %lu pending disconnects\n",
       ap->m_uuid.c_str(), pendingDisconnects.size());
   }
+  if (stopping || !ap->m_vhd) return;
   lws_cancel_service(ap->m_vhd->context);
 }
 void AudioPipe::addPendingWrite(AudioPipe* ap) {
@@ -465,11 +471,11 @@ void AudioPipe::addPendingWrite(AudioPipe* ap) {
   }
   ap->m_stat_last_queue_us = nowUs();
   ap->m_stat_queue_count++;
+  if (stopping || !ap->m_vhd) return;
   lws_cancel_service(ap->m_vhd->context);
 }
 
 bool AudioPipe::lws_service_thread(unsigned int nServiceThread) {
-  std::thread::id this_id = std::this_thread::get_id();
   struct lws_context_creation_info info;
 
   const struct lws_protocols protocols[] = {
@@ -497,17 +503,21 @@ bool AudioPipe::lws_service_thread(unsigned int nServiceThread) {
 
   lwsl_notice("AudioPipe::lws_service_thread creating context in service thread %d.\n", nServiceThread);
 
-  contexts[nServiceThread] = lws_create_context(&info);
-  if (!contexts[nServiceThread]) {
-    lwsl_err("AudioPipe::lws_service_thread failed creating context in service thread %d..\n", nServiceThread); 
+  struct lws_context *context = lws_create_context(&info);
+  if (!context) {
+    lwsl_err("AudioPipe::lws_service_thread failed creating context in service thread %d..\n", nServiceThread);
     return false;
+  }
+  {
+    std::lock_guard<std::mutex> lk(mutex_contexts);
+    contexts[nServiceThread] = context;
   }
 
   int n;
   uint64_t window_start = nowUs();
   uint64_t loops = 0;
   do {
-    n = lws_service(contexts[nServiceThread], 0);
+    n = lws_service(context, 0);
     loops++;
 
     /* Periodic occupancy report. If cb% approaches 100 the thread has no
@@ -547,14 +557,21 @@ bool AudioPipe::lws_service_thread(unsigned int nServiceThread) {
       loops = 0;
       window_start = nowus;
     }
-  } while (n >= 0 && !stopFlags[this_id]);
+  } while (n >= 0 && !stopping);
 
-  // Cleanup once work is done or stopped
+  /* This thread created the context, so this thread destroys it. Destroying it
+   * from the unloading thread while lws_service() was still running was half of
+   * the reload corruption; the other half was detaching, which let a surviving
+   * thread pick up the *next* generation's context out of contexts[]. */
+  struct lws_context *toDestroy = nullptr;
   {
-      std::lock_guard<std::mutex> lock(mapMutex);
-      stopFlags.erase(this_id);
+    std::lock_guard<std::mutex> lk(mutex_contexts);
+    toDestroy = contexts[nServiceThread];
+    contexts[nServiceThread] = nullptr;
   }
-  lwsl_notice("AudioPipe::lws_service_thread ending in service thread %d\n", nServiceThread); 
+  if (toDestroy) lws_context_destroy(toDestroy);
+
+  lwsl_notice("AudioPipe::lws_service_thread ending in service thread %d\n", nServiceThread);
   return true;
 }
 
@@ -563,43 +580,41 @@ void AudioPipe::initialize(const char* protocol, unsigned int nThreads, int logl
 
   numContexts = nThreads;
   protocolName = protocol;
+  stopping = false;
+  nchild = 0;
   lws_set_log_level(loglevel, logger);
 
-  lwsl_notice("AudioPipe::initialize starting %d threads with subprotocol %s\n", nThreads, protocol); 
+  lwsl_notice("AudioPipe::initialize starting %d threads with subprotocol %s\n", nThreads, protocol);
   for (unsigned int i = 0; i < numContexts; i++) {
-    std::lock_guard<std::mutex> lock(mapMutex);
-    std::thread t(&AudioPipe::lws_service_thread, i);
-    stopFlags[t.get_id()] = false;
-    threadIds.push(t.get_id());
-    t.detach();
+    serviceThreads.emplace_back(&AudioPipe::lws_service_thread, i);
   }
 }
 
 bool AudioPipe::deinitialize() {
-  lwsl_notice("AudioPipe::deinitialize\n"); 
-  std::lock_guard<std::mutex> lock(mapMutex);
-  if (!threadIds.empty()) {
-      std::thread::id id = threadIds.front();
-      threadIds.pop();
-      stopFlags[id] = true;
-  }
-/*
-  do
-  {
-    lwsl_notice("waiting for pending connects to complete\n");
-  } while (pendingConnects.size() > 0);
-  do
-  {
-    lwsl_notice("waiting for disconnects to complete\n");
-  } while (pendingDisconnects.size() > 0);
-*/
+  lwsl_notice("AudioPipe::deinitialize\n");
 
-  for (unsigned int i = 0; i < numContexts; i++)
+  /* Ask every service thread to leave its loop, then wake them so they notice
+   * now instead of after an lws_service timeout. Under mutex_contexts so we can
+   * never signal a context a thread is already tearing down. */
+  stopping = true;
   {
-    lwsl_notice("AudioPipe::deinitialize destroying context %d of %d\n", i + 1, numContexts);
-    lws_context_destroy(contexts[i]);
+    std::lock_guard<std::mutex> lk(mutex_contexts);
+    for (unsigned int i = 0; i < numContexts; i++) {
+      if (contexts[i]) lws_cancel_service(contexts[i]);
+    }
   }
-  std::this_thread::sleep_for(std::chrono::seconds(2));
+
+  /* Join, do not sleep-and-hope. Returning from here has to mean no thread is
+   * still executing inside this .so, otherwise the module unloads underneath a
+   * running thread and the next load inherits a zombie. */
+  for (unsigned int i = 0; i < serviceThreads.size(); i++) {
+    if (serviceThreads[i].joinable()) {
+      lwsl_notice("AudioPipe::deinitialize joining service thread %d of %zu\n", i + 1, serviceThreads.size());
+      serviceThreads[i].join();
+    }
+  }
+  serviceThreads.clear();
+  numContexts = 0;
   return true;
 }
 

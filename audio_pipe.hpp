@@ -4,9 +4,9 @@
 #include <string>
 #include <list>
 #include <mutex>
-#include <queue>
-#include <unordered_map>
 #include <thread>
+#include <atomic>
+#include <vector>
 
 #include <libwebsockets.h>
 
@@ -118,7 +118,7 @@ private:
    * lives in lws_callback_impl. */
   static int lws_callback(struct lws *wsi, enum lws_callback_reasons reason, void *user, void *in, size_t len);
   static int lws_callback_impl(struct lws *wsi, enum lws_callback_reasons reason, void *user, void *in, size_t len);
-  static unsigned int nchild;
+  static std::atomic<unsigned int> nchild;
   static struct lws_context *contexts[];
   static unsigned int numContexts;
   static std::string protocolName;
@@ -130,9 +130,14 @@ private:
   static std::list<AudioPipe*> pendingWrites;
   static log_emit_function logger;
 
-  static std::mutex mapMutex;
-  static std::unordered_map<std::thread::id, bool> stopFlags;
-  static std::queue<std::thread::id> threadIds;
+  /* Service thread lifecycle. Threads are joinable and each owns (creates and
+   * destroys) its own lws context, so unloading the module cannot leave a
+   * thread behind still servicing the next generation's context.
+   * mutex_contexts serialises the contexts[] slots so a wakeup can never land
+   * on a context another thread is destroying. */
+  static std::atomic<bool> stopping;
+  static std::vector<std::thread> serviceThreads;
+  static std::mutex mutex_contexts;
 
   static AudioPipe* findAndRemovePendingConnect(struct lws *wsi);
   static AudioPipe* findPendingConnect(struct lws *wsi);

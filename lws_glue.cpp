@@ -25,6 +25,9 @@ extern "C" void fork_session_handle_binary(private_t *tech_pvt, switch_core_sess
 #define RTP_PACKETIZATION_PERIOD 20
 #define FRAME_SIZE_8000  320 /* 20ms frame: 320 bytes at 8kHz PCM16 mono */
 #define PLAYBACK_JITTER_FRAMES 5
+/* How often each session prints its [MOD-BINARY] progress line, in 20ms frames.
+ * 1500 == every 30s, so a 50-call load test stays under 2 lines/sec. */
+#define BINARY_LOG_EVERY_FRAMES 1500
 
 namespace {
   static const char *requestedBufferSecs = std::getenv("MOD_AUDIO_FORK_BUFFER_SECS");
@@ -469,7 +472,6 @@ namespace {
     tech_pvt->playback_direct_mode  = 0;
     tech_pvt->playback_codec_ready  = 0;
     tech_pvt->playback_logged_first_direct_write = 0;
-    tech_pvt->playback_logged_write_replace_skip = 0;
     switch_mutex_init(&tech_pvt->playback_mutex, SWITCH_MUTEX_NESTED,
       switch_core_session_get_pool(session));
     /* Tiny jitter buffer only. Backend/app owns realtime pacing. */
@@ -487,15 +489,17 @@ namespace {
           NULL,
           switch_core_session_get_pool(session)) == SWITCH_STATUS_SUCCESS) {
       tech_pvt->playback_codec_ready = 1;
-      tech_pvt->playback_direct_mode = 1;  /* parked calls need direct writes; WRITE_REPLACE does not drain while parked */
+      tech_pvt->playback_direct_mode = 1;  /* playback path armed; the writer thread owns it */
       start_playback_writer(tech_pvt, session);
       switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
         "(%u) playback direct mode armed: channel_rate=%d frame_bytes=%d\n",
         tech_pvt->id, tech_pvt->playback_channel_rate, tech_pvt->playback_frame_bytes);
     } else {
-      switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING,
-        "(%u) playback direct mode unavailable, falling back to WRITE_REPLACE queue\n",
-        tech_pvt->id);
+      /* There is no fallback path any more: WRITE_REPLACE was removed because it
+       * never ran, so failing to init the L16 codec means no binary playback. */
+      switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
+        "(%u) binary playback UNAVAILABLE: L16 codec init failed (channel_rate=%d frame_bytes=%d)\n",
+        tech_pvt->id, tech_pvt->playback_channel_rate, tech_pvt->playback_frame_bytes);
     }
     /* ────────────────────────────────────────────────────────────────────── */
     
@@ -777,6 +781,14 @@ extern "C" {
         uplinkFlushes, uplinkQueues, (unsigned long long) uplinkKb);
     }
 
+    /* Nothing can reach this tech_pvt through the channel any more (the bug was
+     * detached above under this lock), so release before tearing down --
+     * destroy_tech_pvt destroys this very mutex, and destroying a locked mutex
+     * is undefined. It also joins the writer thread, which we would rather not
+     * wait for while holding a lock. */
+    tech_pvt->pAudioPipe = nullptr;
+    switch_mutex_unlock(tech_pvt->mutex);
+
     destroy_tech_pvt(tech_pvt);
     switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, "(%u) fork_session_cleanup: connection closed\n", id);
     return SWITCH_STATUS_SUCCESS;
@@ -1010,8 +1022,8 @@ extern "C" {
     switch_mutex_unlock(tech_pvt->playback_mutex);
 
     tech_pvt->dbg_binary_frames_rx++;
-    /* every 250 frames == 5s of 20ms audio, frequent enough to watch a load test */
-    if (tech_pvt->dbg_binary_frames_rx == 1 || tech_pvt->dbg_binary_frames_rx % 250 == 0) {
+    if (tech_pvt->dbg_binary_frames_rx == 1 ||
+        tech_pvt->dbg_binary_frames_rx % BINARY_LOG_EVERY_FRAMES == 0) {
       switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
         "(%u) [MOD-BINARY] rx=%u write_bytes=%zu inuse_before=%zu inuse_after=%zu max_buffer=%zu "
         "direct_frames=%u direct_write_ms=%llu avg_write_us=%llu\n",
