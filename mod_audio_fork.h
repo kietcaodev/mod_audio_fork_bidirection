@@ -10,7 +10,7 @@
 /* Bump on every change that gets deployed, so a reload proves which build is
  * actually loaded. FreeSWITCH reports "+OK module loaded" even when it kept the
  * previous .so, so the version line in the log is the only reliable check. */
-#define MOD_AUDIO_FORK_VERSION "1.0.9-paced"
+#define MOD_AUDIO_FORK_VERSION "1.0.10-paced"
 
 #define MY_BUG_NAME "audio_fork"
 #define MAX_BUG_LEN (64)
@@ -173,6 +173,23 @@ struct private_data {
   uint32_t dbg_write_worst_gap_ms;
   uint32_t dbg_write_worst_at_ms;          /* offset into this session's playback */
   uint32_t dbg_write_pauses;               /* interval > 500ms: between turns, not a defect */
+
+  /* [BUG-RE] TEMPORARY: ARRIVAL cadence, same buckets as the write cadence.
+   * v1.0.9 paced the writes and the gap counts did not move, which splits the
+   * hypothesis in two: either the pacing has a defect (timer catch-up burst
+   * after an underrun) or the frames simply ARRIVE with gaps bigger than the
+   * prime cushion -- the writer cannot play what has not arrived. Comparing
+   * rx_gaps against write gaps on the same call decides it: rx ~= write means
+   * the jitter is upstream (backend send or TCP) and the module is faithful;
+   * rx clean while write is gapped means the writer still mishandles it. */
+  uint64_t dbg_last_rx_us;
+  uint64_t dbg_rx_iv_sum;                  /* only intervals <= 500ms */
+  uint32_t dbg_rx_iv_n;
+  uint32_t dbg_rx_gaps_30ms;               /* 30-500ms arrival gap */
+  uint32_t dbg_rx_bunch_10ms;              /* < 10ms: frames arriving bunched */
+  uint32_t dbg_rx_pauses;                  /* > 500ms: between utterances */
+  uint32_t dbg_rx_worst_gap_ms;
+  uint32_t dbg_rx_worst_at_ms;             /* offset in received audio */
   /* ────────────────────────────────────────────────────────────────────────── */
 };
 

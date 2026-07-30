@@ -225,8 +225,12 @@ namespace {
        * it. Should be 20ms; a gap is silence, a bunch is catch-up. */
       if (tech_pvt->dbg_last_write_us) {
         uint64_t iv_us = (uint64_t)(write_start - tech_pvt->dbg_last_write_us);
-        tech_pvt->dbg_write_iv_sum += iv_us;
-        tech_pvt->dbg_write_iv_n++;
+        /* Mean over speech intervals only. Including the 10-30s between-turn
+         * pauses inflated it to 31-55ms and made it unreadable. */
+        if (iv_us <= 500000) {
+          tech_pvt->dbg_write_iv_sum += iv_us;
+          tech_pvt->dbg_write_iv_n++;
+        }
         /* Only 30-500ms counts as a dropout. Anything longer is the pause
          * between turns while the caller speaks -- the first version counted
          * those too, which is why worst_gap_ms came back as 13-31 SECONDS and
@@ -307,6 +311,12 @@ namespace {
           continue;
         }
         primed = 1;
+        /* v1.0.9 defect: the soft timer's reference kept advancing during the
+         * dry spell, so after re-priming, timer_next() was in arrears and
+         * returned immediately for every backlogged tick -- the writes came
+         * out in a burst, reproducing exactly the bunching being fixed.
+         * Resync so pacing restarts from now. */
+        if (have_timer) switch_core_timer_sync(&timer);
       }
 
       if (have_timer) switch_core_timer_next(&timer);
@@ -972,7 +982,8 @@ extern "C" {
           "mad=%d mad_x100_over_rms=%d bstep_mean=%d bstep_max=%u bstep_n=%u "
           "writes=%u during_broadcast=%u "
           "worst_1s_ratio=%d worst_at_ms=%u worst_1s_clip=%u windows_over40=%u/%u "
-          "write_iv_mean_ms=%d gaps30_500=%u bunch10=%u pauses=%u worst_gap_ms=%u worst_gap_at_ms=%u\n",
+          "write_iv_mean_ms=%d gaps30_500=%u bunch10=%u pauses=%u worst_gap_ms=%u worst_gap_at_ms=%u "
+          "rx_iv_mean_ms=%d rx_gaps30_500=%u rx_bunch10=%u rx_pauses=%u rx_worst_gap_ms=%u rx_worst_at_ms=%u\n",
           id,
           (unsigned long long) tech_pvt->dbg_a_samples,
           (int) rms, tech_pvt->dbg_a_peak, tech_pvt->dbg_a_clip, tech_pvt->dbg_a_zero_frames,
@@ -986,7 +997,12 @@ extern "C" {
             ? (int)(tech_pvt->dbg_write_iv_sum / tech_pvt->dbg_write_iv_n / 1000) : -1,
           tech_pvt->dbg_write_gaps_30ms, tech_pvt->dbg_write_bunch_10ms,
           tech_pvt->dbg_write_pauses,
-          tech_pvt->dbg_write_worst_gap_ms, tech_pvt->dbg_write_worst_at_ms);
+          tech_pvt->dbg_write_worst_gap_ms, tech_pvt->dbg_write_worst_at_ms,
+          tech_pvt->dbg_rx_iv_n
+            ? (int)(tech_pvt->dbg_rx_iv_sum / tech_pvt->dbg_rx_iv_n / 1000) : -1,
+          tech_pvt->dbg_rx_gaps_30ms, tech_pvt->dbg_rx_bunch_10ms,
+          tech_pvt->dbg_rx_pauses,
+          tech_pvt->dbg_rx_worst_gap_ms, tech_pvt->dbg_rx_worst_at_ms);
       }
     }
 
@@ -1239,6 +1255,31 @@ extern "C" {
     switch_mutex_unlock(tech_pvt->playback_mutex);
 
     tech_pvt->dbg_binary_frames_rx++;
+
+    /* [BUG-RE] TEMPORARY: arrival cadence -- when frames REACH us, before any
+     * buffering. The counterpart of the write cadence below; comparing the two
+     * on one call locates the jitter source. Runs on the lws service thread. */
+    {
+      uint64_t rx_now = AudioPipe::nowUs();
+      if (tech_pvt->dbg_last_rx_us) {
+        uint64_t iv_us = rx_now - tech_pvt->dbg_last_rx_us;
+        if (iv_us <= 500000) {
+          tech_pvt->dbg_rx_iv_sum += iv_us;
+          tech_pvt->dbg_rx_iv_n++;
+          if (iv_us > 30000) {
+            tech_pvt->dbg_rx_gaps_30ms++;
+            uint32_t gap_ms = (uint32_t)(iv_us / 1000);
+            if (gap_ms > tech_pvt->dbg_rx_worst_gap_ms) {
+              tech_pvt->dbg_rx_worst_gap_ms = gap_ms;
+              tech_pvt->dbg_rx_worst_at_ms = tech_pvt->dbg_binary_frames_rx * 20;
+            }
+          }
+          else if (iv_us < 10000) tech_pvt->dbg_rx_bunch_10ms++;
+        }
+        else tech_pvt->dbg_rx_pauses++;
+      }
+      tech_pvt->dbg_last_rx_us = rx_now;
+    }
 
     /* [BUG-RE] TEMPORARY: dump exactly what arrived, before the jitter buffer
      * and before any resampling, so the bytes can be listened to directly. */
