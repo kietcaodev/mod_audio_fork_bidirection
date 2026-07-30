@@ -90,6 +90,52 @@ namespace {
     }
     tech_pvt->dbg_a_samples += n;
     if (allZero) tech_pvt->dbg_a_zero_frames++;
+
+    /* Same numbers again, but scoped to a one-second window. A call-wide mean
+     * averages a 9-second defect into 70 seconds of clean speech and shows
+     * nothing; this keeps the worst second so a localised burst survives. */
+    for (size_t i = 0; i < n; i++) {
+      int v = s[i];
+      int a = v < 0 ? -v : v;
+      if ((uint32_t) a > tech_pvt->dbg_w_peak) tech_pvt->dbg_w_peak = (uint32_t) a;
+      if (a >= 32000) tech_pvt->dbg_w_clip++;
+      tech_pvt->dbg_w_sumsq += (uint64_t)(v * v);
+      if (i > 0) {
+        int d = v - s[i - 1];
+        tech_pvt->dbg_w_sumabsdiff += (uint64_t)(d < 0 ? -d : d);
+        tech_pvt->dbg_w_interior_n++;
+      }
+    }
+    tech_pvt->dbg_w_samples += (uint32_t) n;
+    tech_pvt->dbg_w_frames++;
+
+    /* 50 frames of 20ms == one second. */
+    if (tech_pvt->dbg_w_frames >= 50) {
+      tech_pvt->dbg_windows_total++;
+      if (tech_pvt->dbg_w_samples > 0 && tech_pvt->dbg_w_interior_n > 0) {
+        double wrms = sqrt((double) tech_pvt->dbg_w_sumsq / (double) tech_pvt->dbg_w_samples);
+        double wmad = (double) tech_pvt->dbg_w_sumabsdiff / (double) tech_pvt->dbg_w_interior_n;
+        /* Ignore near-silent windows: with almost no signal the ratio is noise
+         * on noise and would produce false alarms. */
+        if (wrms > 200.0) {
+          int ratio = (int)(wmad * 100.0 / wrms);
+          if (ratio > tech_pvt->dbg_worst_ratio) {
+            tech_pvt->dbg_worst_ratio = ratio;
+            tech_pvt->dbg_worst_at_ms = tech_pvt->dbg_w_index * 1000;
+          }
+          /* Baseline measured across 20 calls is 23-25, so 40 is comfortably
+           * outside normal speech and marks a window worth looking at. */
+          if (ratio > 40) tech_pvt->dbg_windows_over++;
+        }
+      }
+      if (tech_pvt->dbg_w_clip > tech_pvt->dbg_worst_window_clip)
+        tech_pvt->dbg_worst_window_clip = tech_pvt->dbg_w_clip;
+
+      tech_pvt->dbg_w_index++;
+      tech_pvt->dbg_w_sumsq = tech_pvt->dbg_w_sumabsdiff = 0;
+      tech_pvt->dbg_w_samples = tech_pvt->dbg_w_interior_n = 0;
+      tech_pvt->dbg_w_frames = tech_pvt->dbg_w_clip = tech_pvt->dbg_w_peak = 0;
+    }
   }
 
   static switch_status_t write_playback_frames_direct(private_t *tech_pvt, switch_core_session_t *session, int max_frames) {
@@ -843,13 +889,17 @@ extern "C" {
         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
           "(%u) [MOD-AUDIO-STATS-C] samples=%llu rms=%d peak=%u clip=%u zero_frames=%u "
           "mad=%d mad_x100_over_rms=%d bstep_mean=%d bstep_max=%u bstep_n=%u "
-          "writes=%u during_broadcast=%u\n",
+          "writes=%u during_broadcast=%u "
+          "worst_1s_ratio=%d worst_at_ms=%u worst_1s_clip=%u windows_over40=%u/%u\n",
           id,
           (unsigned long long) tech_pvt->dbg_a_samples,
           (int) rms, tech_pvt->dbg_a_peak, tech_pvt->dbg_a_clip, tech_pvt->dbg_a_zero_frames,
           (int) mad, rms > 0.0 ? (int)(mad * 100.0 / rms) : -1,
           (int) bstep, tech_pvt->dbg_a_bstep_max, tech_pvt->dbg_a_bstep_n,
-          tech_pvt->dbg_writes_total_checked, tech_pvt->dbg_write_during_broadcast);
+          tech_pvt->dbg_writes_total_checked, tech_pvt->dbg_write_during_broadcast,
+          tech_pvt->dbg_worst_ratio, tech_pvt->dbg_worst_at_ms,
+          tech_pvt->dbg_worst_window_clip,
+          tech_pvt->dbg_windows_over, tech_pvt->dbg_windows_total);
       }
     }
 

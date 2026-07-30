@@ -10,7 +10,7 @@
 /* Bump on every change that gets deployed, so a reload proves which build is
  * actually loaded. FreeSWITCH reports "+OK module loaded" even when it kept the
  * previous .so, so the version line in the log is the only reliable check. */
-#define MOD_AUDIO_FORK_VERSION "1.0.6-audiodiag"
+#define MOD_AUDIO_FORK_VERSION "1.0.7-audiodiag"
 
 #define MY_BUG_NAME "audio_fork"
 #define MAX_BUG_LEN (64)
@@ -134,6 +134,27 @@ struct private_data {
    * frames we wrote while FreeSWITCH had a broadcast/playback in progress. */
   uint32_t dbg_write_during_broadcast;
   uint32_t dbg_writes_total_checked;
+
+  /* [BUG-RE] TEMPORARY: per-second windows, because whole-call averages hide
+   * exactly the defect being chased. A caller reported two crackly utterances
+   * between second 11 and 20 of a ~70s call; 9 bad seconds out of 70 barely
+   * move a call-wide mean, which is why every aggregate above read clean.
+   * These keep the WORST one-second window and where it was, so a localised
+   * burst of distortion is visible and can be lined up against the timestamp
+   * the listener reported. */
+  uint64_t dbg_w_sumsq;                    /* current window: sum s^2 */
+  uint64_t dbg_w_sumabsdiff;               /* current window: sum |s[n]-s[n-1]| */
+  uint32_t dbg_w_samples;
+  uint32_t dbg_w_interior_n;
+  uint32_t dbg_w_frames;                   /* frames into the current window */
+  uint32_t dbg_w_clip;
+  uint32_t dbg_w_peak;
+  uint32_t dbg_w_index;                    /* which window (1 per second) */
+  int      dbg_worst_ratio;                /* highest mad*100/rms seen in a window */
+  uint32_t dbg_worst_at_ms;                /* offset of that window into playback */
+  uint32_t dbg_worst_window_clip;          /* most clipped samples in one window */
+  uint32_t dbg_windows_over;               /* windows whose ratio exceeded the bar */
+  uint32_t dbg_windows_total;
   /* ────────────────────────────────────────────────────────────────────────── */
 };
 
