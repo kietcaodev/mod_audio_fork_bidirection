@@ -10,7 +10,7 @@
 /* Bump on every change that gets deployed, so a reload proves which build is
  * actually loaded. FreeSWITCH reports "+OK module loaded" even when it kept the
  * previous .so, so the version line in the log is the only reliable check. */
-#define MOD_AUDIO_FORK_VERSION "1.0.5-audiodiag"
+#define MOD_AUDIO_FORK_VERSION "1.0.6-audiodiag"
 
 #define MY_BUG_NAME "audio_fork"
 #define MAX_BUG_LEN (64)
@@ -125,6 +125,15 @@ struct private_data {
   uint32_t dbg_a_zero_frames;              /* frames that are entirely silence */
   int32_t  dbg_a_prev_last;                /* last sample of the previous frame */
   int      dbg_a_have_prev;
+
+  /* [BUG-RE] TEMPORARY: collision between our writer and the channel's own
+   * audio. A and C both measure clean speech, so the distortion happens after
+   * we hand the frame over -- and the obvious way that happens is two sources
+   * writing one channel. The backend disables binary playback before it runs a
+   * file playback, so this counts how often that sequencing actually fails:
+   * frames we wrote while FreeSWITCH had a broadcast/playback in progress. */
+  uint32_t dbg_write_during_broadcast;
+  uint32_t dbg_writes_total_checked;
   /* ────────────────────────────────────────────────────────────────────────── */
 };
 

@@ -122,6 +122,16 @@ namespace {
 
       dbg_measure_frame(tech_pvt, chunk, bytes_read);   /* [BUG-RE] TEMPORARY */
 
+      /* [BUG-RE] TEMPORARY: is the channel also playing something of its own
+       * right now? CF_BROADCAST is set while uuid_broadcast/playback owns the
+       * write path, so a frame written here at the same moment is a second
+       * source on one channel -- two voices mixed, which is what crackle and
+       * garbled speech sound like. */
+      tech_pvt->dbg_writes_total_checked++;
+      if (switch_channel_test_flag(channel, CF_BROADCAST)) {
+        tech_pvt->dbg_write_during_broadcast++;
+      }
+
       switch_frame_t frame = { 0 };
       frame.codec = &tech_pvt->playback_codec;
       frame.data = chunk;
@@ -832,12 +842,14 @@ extern "C" {
           ? (double) tech_pvt->dbg_a_bstep_sum / (double) tech_pvt->dbg_a_bstep_n : 0.0;
         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
           "(%u) [MOD-AUDIO-STATS-C] samples=%llu rms=%d peak=%u clip=%u zero_frames=%u "
-          "mad=%d mad_x100_over_rms=%d bstep_mean=%d bstep_max=%u bstep_n=%u\n",
+          "mad=%d mad_x100_over_rms=%d bstep_mean=%d bstep_max=%u bstep_n=%u "
+          "writes=%u during_broadcast=%u\n",
           id,
           (unsigned long long) tech_pvt->dbg_a_samples,
           (int) rms, tech_pvt->dbg_a_peak, tech_pvt->dbg_a_clip, tech_pvt->dbg_a_zero_frames,
           (int) mad, rms > 0.0 ? (int)(mad * 100.0 / rms) : -1,
-          (int) bstep, tech_pvt->dbg_a_bstep_max, tech_pvt->dbg_a_bstep_n);
+          (int) bstep, tech_pvt->dbg_a_bstep_max, tech_pvt->dbg_a_bstep_n,
+          tech_pvt->dbg_writes_total_checked, tech_pvt->dbg_write_during_broadcast);
       }
     }
 
