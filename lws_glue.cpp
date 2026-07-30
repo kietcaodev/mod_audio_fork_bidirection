@@ -204,6 +204,26 @@ namespace {
        * intervals is expected under load and the per-event warning was pure
        * noise at 50 calls. The total lands in [MOD-BINARY-SUMMARY]. */
       if (write_elapsed_us > 30000) tech_pvt->dbg_direct_slow_writes++;
+
+      /* [BUG-RE] TEMPORARY: interval between consecutive writes. This is the
+       * delivery cadence the caller actually hears, and nothing else measures
+       * it. Should be 20ms; a gap is silence, a bunch is catch-up. */
+      if (tech_pvt->dbg_last_write_us) {
+        uint64_t iv_us = (uint64_t)(write_start - tech_pvt->dbg_last_write_us);
+        tech_pvt->dbg_write_iv_sum += iv_us;
+        tech_pvt->dbg_write_iv_n++;
+        if (iv_us > 30000) {
+          tech_pvt->dbg_write_gaps_30ms++;
+          uint32_t gap_ms = (uint32_t)(iv_us / 1000);
+          if (gap_ms > tech_pvt->dbg_write_worst_gap_ms) {
+            tech_pvt->dbg_write_worst_gap_ms = gap_ms;
+            /* offset in played audio, so it lines up with a recording */
+            tech_pvt->dbg_write_worst_at_ms = tech_pvt->dbg_direct_frames * 20;
+          }
+        }
+        else if (iv_us < 10000) tech_pvt->dbg_write_bunch_10ms++;
+      }
+      tech_pvt->dbg_last_write_us = (uint64_t) write_start;
     }
 
     return frames_written > 0 ? SWITCH_STATUS_SUCCESS : SWITCH_STATUS_FALSE;
@@ -890,7 +910,8 @@ extern "C" {
           "(%u) [MOD-AUDIO-STATS-C] samples=%llu rms=%d peak=%u clip=%u zero_frames=%u "
           "mad=%d mad_x100_over_rms=%d bstep_mean=%d bstep_max=%u bstep_n=%u "
           "writes=%u during_broadcast=%u "
-          "worst_1s_ratio=%d worst_at_ms=%u worst_1s_clip=%u windows_over40=%u/%u\n",
+          "worst_1s_ratio=%d worst_at_ms=%u worst_1s_clip=%u windows_over40=%u/%u "
+          "write_iv_mean_ms=%d gaps30=%u bunch10=%u worst_gap_ms=%u worst_gap_at_ms=%u\n",
           id,
           (unsigned long long) tech_pvt->dbg_a_samples,
           (int) rms, tech_pvt->dbg_a_peak, tech_pvt->dbg_a_clip, tech_pvt->dbg_a_zero_frames,
@@ -899,7 +920,11 @@ extern "C" {
           tech_pvt->dbg_writes_total_checked, tech_pvt->dbg_write_during_broadcast,
           tech_pvt->dbg_worst_ratio, tech_pvt->dbg_worst_at_ms,
           tech_pvt->dbg_worst_window_clip,
-          tech_pvt->dbg_windows_over, tech_pvt->dbg_windows_total);
+          tech_pvt->dbg_windows_over, tech_pvt->dbg_windows_total,
+          tech_pvt->dbg_write_iv_n
+            ? (int)(tech_pvt->dbg_write_iv_sum / tech_pvt->dbg_write_iv_n / 1000) : -1,
+          tech_pvt->dbg_write_gaps_30ms, tech_pvt->dbg_write_bunch_10ms,
+          tech_pvt->dbg_write_worst_gap_ms, tech_pvt->dbg_write_worst_at_ms);
       }
     }
 

@@ -10,7 +10,7 @@
 /* Bump on every change that gets deployed, so a reload proves which build is
  * actually loaded. FreeSWITCH reports "+OK module loaded" even when it kept the
  * previous .so, so the version line in the log is the only reliable check. */
-#define MOD_AUDIO_FORK_VERSION "1.0.7-audiodiag"
+#define MOD_AUDIO_FORK_VERSION "1.0.8-audiodiag"
 
 #define MY_BUG_NAME "audio_fork"
 #define MAX_BUG_LEN (64)
@@ -155,6 +155,23 @@ struct private_data {
   uint32_t dbg_worst_window_clip;          /* most clipped samples in one window */
   uint32_t dbg_windows_over;               /* windows whose ratio exceeded the bar */
   uint32_t dbg_windows_total;
+
+  /* [BUG-RE] TEMPORARY: the one thing nothing measures -- WHEN we write.
+   * A confirmed-crackly window (37-41s of call 23ba65fb) shows the recording
+   * jumping between loud bursts and 300ms of near-silence, while the backend
+   * reported duty=100% holes=0 and this module reported clean content. Both
+   * are blind because one measures when frames were SENT and the other
+   * measures what is IN them; neither measures the interval between writes.
+   * With playback_hwm=0 and avg_write_us=0 there is no buffer and no pacing on
+   * prod, so arrival jitter passes straight through as gaps at the caller.
+   * Frames should leave here every 20ms. */
+  uint64_t dbg_last_write_us;
+  uint64_t dbg_write_iv_sum;
+  uint32_t dbg_write_iv_n;
+  uint32_t dbg_write_gaps_30ms;            /* interval > 30ms: a hole the caller hears */
+  uint32_t dbg_write_bunch_10ms;           /* interval < 10ms: catch-up bunching */
+  uint32_t dbg_write_worst_gap_ms;
+  uint32_t dbg_write_worst_at_ms;          /* offset into this session's playback */
   /* ────────────────────────────────────────────────────────────────────────── */
 };
 
