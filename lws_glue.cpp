@@ -13,6 +13,7 @@
 #include <sstream>
 #include <regex>
 #include <vector>
+#include <cmath>    /* [BUG-RE] TEMPORARY: sqrt for the RMS in [MOD-AUDIO-STATS-C] */
 
 #include "base64.hpp"
 #include "parser.hpp"
@@ -40,11 +41,56 @@ namespace {
    * steady state, so extra depth costs no latency until a burst actually needs
    * it -- but note that once depth accumulates the writer only drains at
    * realtime, so it persists until the utterance ends or a flush arrives. */
+  /* [BUG-RE] TEMPORARY. Set MOD_AUDIO_FORK_DUMP_PCM_UUID to a call uuid (or to
+   * "all") and every binary frame that arrives for it is appended verbatim to
+   * <temp_dir>/<uuid>.rx.raw. Import in Audacity as PCM16 LE / 8000 Hz / mono.
+   * No counter can answer "was it already distorted when it got here"; this
+   * can. Off unless the variable is set. */
+  static const char *dumpPcmUuid = std::getenv("MOD_AUDIO_FORK_DUMP_PCM_UUID");
+
   static const char *requestedJitterFrames = std::getenv("MOD_AUDIO_FORK_PLAYBACK_JITTER_FRAMES");
   static int nPlaybackJitterFrames =
     std::max(3, std::min(requestedJitterFrames ? ::atoi(requestedJitterFrames) : 15, 50));
   static unsigned int idxCallCount = 0;
   static uint32_t playCount = 0;
+
+  /* [BUG-RE] TEMPORARY. Measure the waveform actually handed to the channel.
+   * Called on exactly the bytes passed to switch_core_session_write_frame, so
+   * whatever this reports is what the caller was sent. */
+  static void dbg_measure_frame(private_t *tech_pvt, const uint8_t *buf, size_t bytes) {
+    const int16_t *s = (const int16_t *) buf;
+    size_t n = bytes / 2;
+    if (n == 0) return;
+
+    /* Boundary step: discontinuity between frames, which is what a splice
+     * sounds like. Tracked separately from interior steps so the two can be
+     * compared -- a boundary mean far above the interior mean is the proof. */
+    if (tech_pvt->dbg_a_have_prev) {
+      uint32_t step = (uint32_t) abs((int) s[0] - tech_pvt->dbg_a_prev_last);
+      tech_pvt->dbg_a_bstep_sum += step;
+      tech_pvt->dbg_a_bstep_n++;
+      if (step > tech_pvt->dbg_a_bstep_max) tech_pvt->dbg_a_bstep_max = step;
+    }
+    tech_pvt->dbg_a_prev_last = s[n - 1];
+    tech_pvt->dbg_a_have_prev = 1;
+
+    int allZero = 1;
+    for (size_t i = 0; i < n; i++) {
+      int v = s[i];
+      int a = v < 0 ? -v : v;
+      if (a) allZero = 0;
+      if ((uint32_t) a > tech_pvt->dbg_a_peak) tech_pvt->dbg_a_peak = (uint32_t) a;
+      if (a >= 32000) tech_pvt->dbg_a_clip++;
+      tech_pvt->dbg_a_sumsq += (uint64_t)(v * v);
+      if (i > 0) {
+        int d = v - s[i - 1];
+        tech_pvt->dbg_a_sumabsdiff += (uint64_t)(d < 0 ? -d : d);
+        tech_pvt->dbg_a_interior_n++;
+      }
+    }
+    tech_pvt->dbg_a_samples += n;
+    if (allZero) tech_pvt->dbg_a_zero_frames++;
+  }
 
   static switch_status_t write_playback_frames_direct(private_t *tech_pvt, switch_core_session_t *session, int max_frames) {
     if (!tech_pvt || !session || !tech_pvt->playback_direct_mode || !tech_pvt->playback_codec_ready ||
@@ -73,6 +119,8 @@ namespace {
       if (bytes_read < (size_t)tech_pvt->playback_frame_bytes) {
         break;
       }
+
+      dbg_measure_frame(tech_pvt, chunk, bytes_read);   /* [BUG-RE] TEMPORARY */
 
       switch_frame_t frame = { 0 };
       frame.codec = &tech_pvt->playback_codec;
@@ -771,6 +819,26 @@ extern "C" {
         (unsigned long long)(tech_pvt->dbg_direct_frames ?
           tech_pvt->dbg_direct_write_us / tech_pvt->dbg_direct_frames : 0),
         uplinkFlushes, uplinkQueues, (unsigned long long) uplinkKb);
+
+      /* [BUG-RE] TEMPORARY: what the waveform itself looked like.
+       * mad_x100_over_rms is the number to read: clean telephony speech lands
+       * well under 100; at or above 100 the signal carries high-frequency
+       * content 8 kHz cannot represent, which is what crackle is. */
+      if (tech_pvt->dbg_a_samples > 0) {
+        double rms = sqrt((double) tech_pvt->dbg_a_sumsq / (double) tech_pvt->dbg_a_samples);
+        double mad = tech_pvt->dbg_a_interior_n
+          ? (double) tech_pvt->dbg_a_sumabsdiff / (double) tech_pvt->dbg_a_interior_n : 0.0;
+        double bstep = tech_pvt->dbg_a_bstep_n
+          ? (double) tech_pvt->dbg_a_bstep_sum / (double) tech_pvt->dbg_a_bstep_n : 0.0;
+        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
+          "(%u) [MOD-AUDIO-STATS-C] samples=%llu rms=%d peak=%u clip=%u zero_frames=%u "
+          "mad=%d mad_x100_over_rms=%d bstep_mean=%d bstep_max=%u bstep_n=%u\n",
+          id,
+          (unsigned long long) tech_pvt->dbg_a_samples,
+          (int) rms, tech_pvt->dbg_a_peak, tech_pvt->dbg_a_clip, tech_pvt->dbg_a_zero_frames,
+          (int) mad, rms > 0.0 ? (int)(mad * 100.0 / rms) : -1,
+          (int) bstep, tech_pvt->dbg_a_bstep_max, tech_pvt->dbg_a_bstep_n);
+      }
     }
 
     /* Nothing can reach this tech_pvt through the channel any more (the bug was
@@ -1022,6 +1090,20 @@ extern "C" {
     switch_mutex_unlock(tech_pvt->playback_mutex);
 
     tech_pvt->dbg_binary_frames_rx++;
+
+    /* [BUG-RE] TEMPORARY: dump exactly what arrived, before the jitter buffer
+     * and before any resampling, so the bytes can be listened to directly. */
+    if (dumpPcmUuid && (0 == strcmp(dumpPcmUuid, "all") ||
+                        0 == strcmp(dumpPcmUuid, tech_pvt->sessionId))) {
+      char szDumpPath[512];
+      switch_snprintf(szDumpPath, sizeof(szDumpPath), "%s%s%s.rx.raw",
+        SWITCH_GLOBAL_dirs.temp_dir, SWITCH_PATH_SEPARATOR, tech_pvt->sessionId);
+      std::ofstream f(szDumpPath, std::ios::binary | std::ios::app);
+      if (f.is_open()) {
+        f.write((const char *) data, (std::streamsize) len);
+        f.close();
+      }
+    }
     /* Deliberately no write_frame here: this runs on the shared lws service
      * thread. The per-session playback writer thread picks the data up. */
   }

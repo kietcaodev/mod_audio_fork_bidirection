@@ -10,7 +10,7 @@
 /* Bump on every change that gets deployed, so a reload proves which build is
  * actually loaded. FreeSWITCH reports "+OK module loaded" even when it kept the
  * previous .so, so the version line in the log is the only reliable check. */
-#define MOD_AUDIO_FORK_VERSION "1.0.4"
+#define MOD_AUDIO_FORK_VERSION "1.0.5-audiodiag"
 
 #define MY_BUG_NAME "audio_fork"
 #define MAX_BUG_LEN (64)
@@ -96,6 +96,35 @@ struct private_data {
   uint64_t dbg_direct_write_us;            /* cumulative us spent in switch_core_session_write_frame */
   uint32_t dbg_playback_hwm_bytes;         /* deepest the playback jitter buffer ever got */
   uint32_t dbg_playback_overflow_frames;   /* frames dropped because that buffer was full */
+
+  /* ── [BUG-RE] TEMPORARY: audio *content* instrumentation ──────────────────
+   * Every existing counter measures timing and counts; none of them look at
+   * the samples. All of them read clean while callers still hear crackle, so
+   * these measure the waveform itself, on the exact bytes handed to the
+   * channel. Remove once the root cause is confirmed and fixed.
+   *
+   *  mad/rms  - clean 8 kHz speech is lowpass, so the mean absolute
+   *             sample-to-sample difference is well below RMS. A ratio near or
+   *             above 1.0 means high-frequency garbage: byte-misaligned PCM,
+   *             aliasing from a bad downsample, or noise. This is the crackle
+   *             detector.
+   *  bstep    - mean step across a frame boundary vs the mean step inside a
+   *             frame. Much larger at boundaries means frames are being
+   *             spliced discontinuously, which is heard as clicks.
+   *  clip     - samples at full scale, which PCMU/PCMA companding turns into
+   *             harsh distortion. */
+  uint64_t dbg_a_samples;
+  uint64_t dbg_a_sumsq;                    /* sum of s^2, for RMS */
+  uint64_t dbg_a_sumabsdiff;               /* sum |s[n]-s[n-1]| within frames */
+  uint64_t dbg_a_interior_n;
+  uint64_t dbg_a_bstep_sum;                /* sum |first - previous frame's last| */
+  uint32_t dbg_a_bstep_n;
+  uint32_t dbg_a_bstep_max;
+  uint32_t dbg_a_peak;
+  uint32_t dbg_a_clip;                     /* |s| >= 32000 */
+  uint32_t dbg_a_zero_frames;              /* frames that are entirely silence */
+  int32_t  dbg_a_prev_last;                /* last sample of the previous frame */
+  int      dbg_a_have_prev;
   /* ────────────────────────────────────────────────────────────────────────── */
 };
 
