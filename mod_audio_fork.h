@@ -10,7 +10,7 @@
 /* Bump on every change that gets deployed, so a reload proves which build is
  * actually loaded. FreeSWITCH reports "+OK module loaded" even when it kept the
  * previous .so, so the version line in the log is the only reliable check. */
-#define MOD_AUDIO_FORK_VERSION "1.0.8-audiodiag"
+#define MOD_AUDIO_FORK_VERSION "1.0.9-paced"
 
 #define MY_BUG_NAME "audio_fork"
 #define MAX_BUG_LEN (64)
@@ -172,6 +172,7 @@ struct private_data {
   uint32_t dbg_write_bunch_10ms;           /* interval < 10ms: catch-up bunching */
   uint32_t dbg_write_worst_gap_ms;
   uint32_t dbg_write_worst_at_ms;          /* offset into this session's playback */
+  uint32_t dbg_write_pauses;               /* interval > 500ms: between turns, not a defect */
   /* ────────────────────────────────────────────────────────────────────────── */
 };
 

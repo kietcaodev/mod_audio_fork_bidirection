@@ -48,6 +48,21 @@ namespace {
    * can. Off unless the variable is set. */
   static const char *dumpPcmUuid = std::getenv("MOD_AUDIO_FORK_DUMP_PCM_UUID");
 
+  /* Pace the writer off a real timer instead of relying on
+   * switch_core_session_write_frame() to block. That reliance held on a busy
+   * box (measured avg_write_us=17811 when the channel's own write path was
+   * contended) but not on an idle one: on prod the same call reports
+   * avg_write_us=0, so nothing paced the audio at all and the write cadence
+   * was simply whatever cadence TCP delivered frames in -- 15% of intervals
+   * over 30ms and 15% under 10ms, across all 25 calls measured.
+   * Set MOD_AUDIO_FORK_PLAYBACK_PACED=0 to fall back to the old behaviour for
+   * an A/B. Frames to hold before starting: MOD_AUDIO_FORK_PLAYBACK_PRIME. */
+  static const char *requestedPaced = std::getenv("MOD_AUDIO_FORK_PLAYBACK_PACED");
+  static int nPlaybackPaced = requestedPaced ? ::atoi(requestedPaced) : 1;
+  static const char *requestedPrime = std::getenv("MOD_AUDIO_FORK_PLAYBACK_PRIME");
+  static int nPlaybackPrimeFrames =
+    std::max(0, std::min(requestedPrime ? ::atoi(requestedPrime) : 2, 10));
+
   static const char *requestedJitterFrames = std::getenv("MOD_AUDIO_FORK_PLAYBACK_JITTER_FRAMES");
   static int nPlaybackJitterFrames =
     std::max(3, std::min(requestedJitterFrames ? ::atoi(requestedJitterFrames) : 15, 50));
@@ -212,7 +227,11 @@ namespace {
         uint64_t iv_us = (uint64_t)(write_start - tech_pvt->dbg_last_write_us);
         tech_pvt->dbg_write_iv_sum += iv_us;
         tech_pvt->dbg_write_iv_n++;
-        if (iv_us > 30000) {
+        /* Only 30-500ms counts as a dropout. Anything longer is the pause
+         * between turns while the caller speaks -- the first version counted
+         * those too, which is why worst_gap_ms came back as 13-31 SECONDS and
+         * made the figure useless. */
+        if (iv_us > 30000 && iv_us <= 500000) {
           tech_pvt->dbg_write_gaps_30ms++;
           uint32_t gap_ms = (uint32_t)(iv_us / 1000);
           if (gap_ms > tech_pvt->dbg_write_worst_gap_ms) {
@@ -221,6 +240,7 @@ namespace {
             tech_pvt->dbg_write_worst_at_ms = tech_pvt->dbg_direct_frames * 20;
           }
         }
+        else if (iv_us > 500000) tech_pvt->dbg_write_pauses++;
         else if (iv_us < 10000) tech_pvt->dbg_write_bunch_10ms++;
       }
       tech_pvt->dbg_last_write_us = (uint64_t) write_start;
@@ -240,8 +260,30 @@ namespace {
     private_t *tech_pvt = (private_t *) obj;
     switch_core_session_t *session = tech_pvt->session;
 
+    /* Real timer at the channel's frame interval. switch_core_timer_next()
+     * returns immediately when the tick is already due, so a write that did
+     * block does not get double-paced -- the cadence self-corrects. */
+    switch_timer_t timer = { 0 };
+    int have_timer = 0;
+    int interval_ms = 20;
+    if (nPlaybackPaced && tech_pvt->playback_channel_rate > 0 && tech_pvt->playback_frame_bytes > 0) {
+      int samples_per_packet = tech_pvt->playback_frame_bytes / 2;
+      interval_ms = samples_per_packet * 1000 / tech_pvt->playback_channel_rate;
+      if (interval_ms <= 0) interval_ms = 20;
+      if (switch_core_timer_init(&timer, "soft", interval_ms, samples_per_packet,
+            switch_core_session_get_pool(session)) == SWITCH_STATUS_SUCCESS) {
+        have_timer = 1;
+      }
+    }
+
     switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG,
-      "(%u) playback writer thread started\n", tech_pvt->id);
+      "(%u) playback writer thread started (paced=%d interval=%dms prime=%d)\n",
+      tech_pvt->id, have_timer, interval_ms, nPlaybackPrimeFrames);
+
+    /* Hold a couple of frames before the first write so that arrival jitter
+     * has something to eat into. Re-armed whenever the buffer runs dry, since
+     * flush and end-of-turn both empty it. */
+    int primed = 0;
 
     while (!tech_pvt->playback_thread_stop) {
       switch_channel_t *channel = switch_core_session_get_channel(session);
@@ -251,17 +293,34 @@ namespace {
       if (!channel || !switch_channel_up(channel)) break;
 
       if (!tech_pvt->playback_active || !tech_pvt->playback_buffer) {
+        primed = 0;
         switch_yield(10000);   /* idle: nothing to play, latency here is free */
         continue;
       }
+
+      if (!primed) {
+        switch_mutex_lock(tech_pvt->playback_mutex);
+        size_t have = switch_buffer_inuse(tech_pvt->playback_buffer);
+        switch_mutex_unlock(tech_pvt->playback_mutex);
+        if (have < (size_t)(nPlaybackPrimeFrames * tech_pvt->playback_frame_bytes)) {
+          switch_yield(2000);
+          continue;
+        }
+        primed = 1;
+      }
+
+      if (have_timer) switch_core_timer_next(&timer);
 
       /* No separate "is there data" probe: write_playback_frames_direct already
        * checks under the lock and reports FALSE when it wrote nothing, so
        * peeking first only doubled the per-frame locking. */
       if (write_playback_frames_direct(tech_pvt, session, 1) != SWITCH_STATUS_SUCCESS) {
-        switch_yield(2000);   /* underrun: let the channel's own audio through */
+        primed = 0;            /* ran dry: re-prime before speaking again */
+        if (!have_timer) switch_yield(2000);
       }
     }
+
+    if (have_timer) switch_core_timer_destroy(&timer);
 
     /* Nothing logged on exit: the same figures are in [MOD-BINARY-SUMMARY],
      * which fires once per session in fork_session_cleanup. */
@@ -774,6 +833,8 @@ extern "C" {
     switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "mod_audio_fork: lws service threads:       %d\n", nServiceThreads);
     switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "mod_audio_fork: playback jitter frames:    %d (%d ms)\n",
       nPlaybackJitterFrames, nPlaybackJitterFrames * RTP_PACKETIZATION_PERIOD);
+    switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "mod_audio_fork: playback paced / prime:     %d / %d frames\n",
+      nPlaybackPaced, nPlaybackPrimeFrames);
  
     int logs = LLL_ERR | LLL_WARN | LLL_NOTICE ;
      //LLL_INFO | LLL_PARSER | LLL_HEADER | LLL_EXT | LLL_CLIENT  | LLL_LATENCY | LLL_DEBUG ;
@@ -911,7 +972,7 @@ extern "C" {
           "mad=%d mad_x100_over_rms=%d bstep_mean=%d bstep_max=%u bstep_n=%u "
           "writes=%u during_broadcast=%u "
           "worst_1s_ratio=%d worst_at_ms=%u worst_1s_clip=%u windows_over40=%u/%u "
-          "write_iv_mean_ms=%d gaps30=%u bunch10=%u worst_gap_ms=%u worst_gap_at_ms=%u\n",
+          "write_iv_mean_ms=%d gaps30_500=%u bunch10=%u pauses=%u worst_gap_ms=%u worst_gap_at_ms=%u\n",
           id,
           (unsigned long long) tech_pvt->dbg_a_samples,
           (int) rms, tech_pvt->dbg_a_peak, tech_pvt->dbg_a_clip, tech_pvt->dbg_a_zero_frames,
@@ -924,6 +985,7 @@ extern "C" {
           tech_pvt->dbg_write_iv_n
             ? (int)(tech_pvt->dbg_write_iv_sum / tech_pvt->dbg_write_iv_n / 1000) : -1,
           tech_pvt->dbg_write_gaps_30ms, tech_pvt->dbg_write_bunch_10ms,
+          tech_pvt->dbg_write_pauses,
           tech_pvt->dbg_write_worst_gap_ms, tech_pvt->dbg_write_worst_at_ms);
       }
     }
