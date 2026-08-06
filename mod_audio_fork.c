@@ -44,75 +44,10 @@ static switch_bool_t capture_callback(switch_media_bug_t *bug, void *user_data, 
 		return fork_frame(session, bug);
 		break;
 
-	case SWITCH_ABC_TYPE_WRITE_REPLACE:
-		{
-			/* Inject binary playback PCM into the outbound RTP frame (every 20 ms).
-			 * Drains tech_pvt->playback_buffer filled by fork_session_handle_binary(). */
-			private_t *tech_pvt = (private_t *) switch_core_media_bug_get_user_data(bug);
-			if (!tech_pvt || !tech_pvt->playback_active || !tech_pvt->playback_buffer) break;
-			if (tech_pvt->playback_direct_mode) {
-				if (!tech_pvt->playback_logged_write_replace_skip) {
-					tech_pvt->playback_logged_write_replace_skip = 1;
-					switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
-						"(%u) WRITE_REPLACE bypassed: direct playback mode active for parked-call fallback\n",
-						tech_pvt->id);
-				}
-				break;
-			}
-			switch_frame_t *frame = switch_core_media_bug_get_write_replace_frame(bug);
-			if (!frame || !frame->data || frame->datalen == 0) break;
-			switch_mutex_lock(tech_pvt->playback_mutex);
-			size_t available = switch_buffer_inuse(tech_pvt->playback_buffer);
-			size_t needed    = frame->datalen;
-			if (available >= needed) {
-				/* Track high-water mark and alert on buffer backlog > 10 frames (200ms) */
-				if (available > tech_pvt->dbg_buf_hwm_bytes)
-					tech_pvt->dbg_buf_hwm_bytes = (uint32_t)available;
-				if (available > 10 * needed) {
-					tech_pvt->dbg_buf_oversize_events++;
-					if (tech_pvt->dbg_buf_oversize_events == 1 || tech_pvt->dbg_buf_oversize_events % 25 == 0) {
-						switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING,
-							"(%u) [MOD-WR-BACKLOG] #%u buf_before=%zu needed=%zu depth_frames=%.1f hwm=%u\n",
-							tech_pvt->id, tech_pvt->dbg_buf_oversize_events,
-							available, needed, (double)available / (double)needed,
-							tech_pvt->dbg_buf_hwm_bytes);
-					}
-				}
-				switch_buffer_read(tech_pvt->playback_buffer, frame->data, needed);
-				switch_core_media_bug_set_write_replace_frame(bug, frame);
-				tech_pvt->dbg_wr_frames_full++;
-				/* Log first frame + every 100th */
-				if (tech_pvt->dbg_wr_frames_full == 1 || tech_pvt->dbg_wr_frames_full % 100 == 0) {
-					switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
-						"(%u) [MOD-WR] full #%u needed=%zu avail_before=%zu avail_after=%zu hwm=%u\n",
-						tech_pvt->id, tech_pvt->dbg_wr_frames_full,
-						needed, available,
-						switch_buffer_inuse(tech_pvt->playback_buffer),
-						tech_pvt->dbg_buf_hwm_bytes);
-				}
-			} else if (available > 0) {
-				/* Partial fill: silence-pad the remainder */
-				switch_buffer_read(tech_pvt->playback_buffer, frame->data, available);
-				memset((uint8_t *)frame->data + available, 0, needed - available);
-				switch_core_media_bug_set_write_replace_frame(bug, frame);
-				tech_pvt->dbg_wr_frames_partial++;
-				switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING,
-					"(%u) [MOD-WR] PARTIAL #%u needed=%zu avail=%zu (silence-padded %zu B)\n",
-					tech_pvt->id, tech_pvt->dbg_wr_frames_partial,
-					needed, available, needed - available);
-			} else {
-				/* Empty buffer — FreeSWITCH keeps original frame (silence / last frame) */
-				tech_pvt->dbg_wr_frames_underrun++;
-				if (tech_pvt->dbg_wr_frames_underrun % 100 == 1) {
-					switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG,
-						"(%u) [MOD-WR] underrun #%u (buf empty, keeping silence)\n",
-						tech_pvt->id, tech_pvt->dbg_wr_frames_underrun);
-				}
-			}
-			switch_mutex_unlock(tech_pvt->playback_mutex);
-		}
-		break;
-
+	/* No SWITCH_ABC_TYPE_WRITE_REPLACE handler: binary playback is injected by
+	 * the per-session writer thread in lws_glue.cpp, so the bug is registered
+	 * without SMBF_WRITE_REPLACE and this callback is never asked to run on the
+	 * outbound path at all. */
 	case SWITCH_ABC_TYPE_WRITE:
 	default:
 		break;
@@ -162,7 +97,7 @@ static switch_status_t start_capture(switch_core_session_t *session,
 		return SWITCH_STATUS_FALSE;
 	}
 	switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "adding bug %s.\n", bugname);
-	if ((status = switch_core_media_bug_add(session, bugname, NULL, capture_callback, pUserData, 0, flags | SMBF_WRITE_REPLACE, &bug)) != SWITCH_STATUS_SUCCESS) {
+	if ((status = switch_core_media_bug_add(session, bugname, NULL, capture_callback, pUserData, 0, flags, &bug)) != SWITCH_STATUS_SUCCESS) {
 		return status;
 	}
 	switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "setting bug private data %s.\n", bugname);
@@ -366,17 +301,23 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_audio_fork_load)
 {
 	switch_api_interface_t *api_interface;
 
-	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "mod_audio_fork API loading..\n");
+	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "mod_audio_fork v%s API loading..\n", MOD_AUDIO_FORK_VERSION);
 
 	/* connect my internal structure to the blank pointer passed to me */
 	*module_interface = switch_loadable_module_create_module_interface(pool, modname);
 
 	/* create/register custom event message types */
+	/* All six original subclasses plus the four this fork also fires; firing an
+	 * unreserved subclass warns on every event. */
 	if (switch_event_reserve_subclass(EVENT_TRANSCRIPTION) != SWITCH_STATUS_SUCCESS ||
     switch_event_reserve_subclass(EVENT_TRANSFER) != SWITCH_STATUS_SUCCESS ||
     switch_event_reserve_subclass(EVENT_PLAY_AUDIO) != SWITCH_STATUS_SUCCESS ||
     switch_event_reserve_subclass(EVENT_KILL_AUDIO) != SWITCH_STATUS_SUCCESS ||
     switch_event_reserve_subclass(EVENT_ERROR) != SWITCH_STATUS_SUCCESS ||
+    switch_event_reserve_subclass(EVENT_CONNECT_SUCCESS) != SWITCH_STATUS_SUCCESS ||
+    switch_event_reserve_subclass(EVENT_CONNECT_FAIL) != SWITCH_STATUS_SUCCESS ||
+    switch_event_reserve_subclass(EVENT_BUFFER_OVERRUN) != SWITCH_STATUS_SUCCESS ||
+    switch_event_reserve_subclass(EVENT_JSON) != SWITCH_STATUS_SUCCESS ||
     switch_event_reserve_subclass(EVENT_DISCONNECT) != SWITCH_STATUS_SUCCESS) {
 
 		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Couldn't register an event subclass for mod_audio_fork API.\n");
@@ -390,7 +331,7 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_audio_fork_load)
 
 	fork_init();
 
-	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "mod_audio_fork API successfully loaded\n");
+	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "mod_audio_fork v%s API successfully loaded\n", MOD_AUDIO_FORK_VERSION);
 
 	/* indicate that the module should continue to be loaded */
   //mod_running = 1;
@@ -410,6 +351,10 @@ SWITCH_MODULE_SHUTDOWN_FUNCTION(mod_audio_fork_shutdown)
 	switch_event_free_subclass(EVENT_KILL_AUDIO);
 	switch_event_free_subclass(EVENT_DISCONNECT);
 	switch_event_free_subclass(EVENT_ERROR);
+	switch_event_free_subclass(EVENT_CONNECT_SUCCESS);
+	switch_event_free_subclass(EVENT_CONNECT_FAIL);
+	switch_event_free_subclass(EVENT_BUFFER_OVERRUN);
+	switch_event_free_subclass(EVENT_JSON);
 
 	return SWITCH_STATUS_SUCCESS;
 }

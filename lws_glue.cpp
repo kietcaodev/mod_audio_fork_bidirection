@@ -13,6 +13,7 @@
 #include <sstream>
 #include <regex>
 #include <vector>
+#include <cmath>    /* [BUG-RE] TEMPORARY: sqrt for the RMS in [MOD-AUDIO-STATS-C] */
 
 #include "base64.hpp"
 #include "parser.hpp"
@@ -24,7 +25,6 @@ extern "C" void fork_session_handle_binary(private_t *tech_pvt, switch_core_sess
 
 #define RTP_PACKETIZATION_PERIOD 20
 #define FRAME_SIZE_8000  320 /* 20ms frame: 320 bytes at 8kHz PCM16 mono */
-#define PLAYBACK_JITTER_FRAMES 5
 
 namespace {
   static const char *requestedBufferSecs = std::getenv("MOD_AUDIO_FORK_BUFFER_SECS");
@@ -33,12 +33,130 @@ namespace {
   static const char* mySubProtocolName = std::getenv("MOD_AUDIO_FORK_SUBPROTOCOL_NAME") ?
     std::getenv("MOD_AUDIO_FORK_SUBPROTOCOL_NAME") : "audio.drachtio.org";
   static unsigned int nServiceThreads = std::max(1, std::min(requestedNumServiceThreads ? ::atoi(requestedNumServiceThreads) : 1, 5));
+
+  /* Depth of the per-session playback jitter buffer, in 20ms frames.
+   * switch_core_session_write_frame() occasionally blocks for two frame
+   * intervals instead of one, which at 5 frames (100ms) was enough to overflow
+   * and drop audio the backend had already sent. The buffer sits near-empty in
+   * steady state, so extra depth costs no latency until a burst actually needs
+   * it -- but note that once depth accumulates the writer only drains at
+   * realtime, so it persists until the utterance ends or a flush arrives. */
+  /* [BUG-RE] TEMPORARY. Set MOD_AUDIO_FORK_DUMP_PCM_UUID to a call uuid (or to
+   * "all") and every binary frame that arrives for it is appended verbatim to
+   * <temp_dir>/<uuid>.rx.raw. Import in Audacity as PCM16 LE / 8000 Hz / mono.
+   * No counter can answer "was it already distorted when it got here"; this
+   * can. Off unless the variable is set. */
+  static const char *dumpPcmUuid = std::getenv("MOD_AUDIO_FORK_DUMP_PCM_UUID");
+
+  /* Pace the writer off a real timer instead of relying on
+   * switch_core_session_write_frame() to block. That reliance held on a busy
+   * box (measured avg_write_us=17811 when the channel's own write path was
+   * contended) but not on an idle one: on prod the same call reports
+   * avg_write_us=0, so nothing paced the audio at all and the write cadence
+   * was simply whatever cadence TCP delivered frames in -- 15% of intervals
+   * over 30ms and 15% under 10ms, across all 25 calls measured.
+   * Set MOD_AUDIO_FORK_PLAYBACK_PACED=0 to fall back to the old behaviour for
+   * an A/B. Frames to hold before starting: MOD_AUDIO_FORK_PLAYBACK_PRIME. */
+  static const char *requestedPaced = std::getenv("MOD_AUDIO_FORK_PLAYBACK_PACED");
+  static int nPlaybackPaced = requestedPaced ? ::atoi(requestedPaced) : 1;
+  static const char *requestedPrime = std::getenv("MOD_AUDIO_FORK_PLAYBACK_PRIME");
+  static int nPlaybackPrimeFrames =
+    std::max(0, std::min(requestedPrime ? ::atoi(requestedPrime) : 2, 10));
+
+  static const char *requestedJitterFrames = std::getenv("MOD_AUDIO_FORK_PLAYBACK_JITTER_FRAMES");
+  static int nPlaybackJitterFrames =
+    std::max(3, std::min(requestedJitterFrames ? ::atoi(requestedJitterFrames) : 15, 50));
   static unsigned int idxCallCount = 0;
   static uint32_t playCount = 0;
 
+  /* [BUG-RE] TEMPORARY. Measure the waveform actually handed to the channel.
+   * Called on exactly the bytes passed to switch_core_session_write_frame, so
+   * whatever this reports is what the caller was sent. */
+  static void dbg_measure_frame(private_t *tech_pvt, const uint8_t *buf, size_t bytes) {
+    const int16_t *s = (const int16_t *) buf;
+    size_t n = bytes / 2;
+    if (n == 0) return;
+
+    /* Boundary step: discontinuity between frames, which is what a splice
+     * sounds like. Tracked separately from interior steps so the two can be
+     * compared -- a boundary mean far above the interior mean is the proof. */
+    if (tech_pvt->dbg_a_have_prev) {
+      uint32_t step = (uint32_t) abs((int) s[0] - tech_pvt->dbg_a_prev_last);
+      tech_pvt->dbg_a_bstep_sum += step;
+      tech_pvt->dbg_a_bstep_n++;
+      if (step > tech_pvt->dbg_a_bstep_max) tech_pvt->dbg_a_bstep_max = step;
+    }
+    tech_pvt->dbg_a_prev_last = s[n - 1];
+    tech_pvt->dbg_a_have_prev = 1;
+
+    int allZero = 1;
+    for (size_t i = 0; i < n; i++) {
+      int v = s[i];
+      int a = v < 0 ? -v : v;
+      if (a) allZero = 0;
+      if ((uint32_t) a > tech_pvt->dbg_a_peak) tech_pvt->dbg_a_peak = (uint32_t) a;
+      if (a >= 32000) tech_pvt->dbg_a_clip++;
+      tech_pvt->dbg_a_sumsq += (uint64_t)(v * v);
+      if (i > 0) {
+        int d = v - s[i - 1];
+        tech_pvt->dbg_a_sumabsdiff += (uint64_t)(d < 0 ? -d : d);
+        tech_pvt->dbg_a_interior_n++;
+      }
+    }
+    tech_pvt->dbg_a_samples += n;
+    if (allZero) tech_pvt->dbg_a_zero_frames++;
+
+    /* Same numbers again, but scoped to a one-second window. A call-wide mean
+     * averages a 9-second defect into 70 seconds of clean speech and shows
+     * nothing; this keeps the worst second so a localised burst survives. */
+    for (size_t i = 0; i < n; i++) {
+      int v = s[i];
+      int a = v < 0 ? -v : v;
+      if ((uint32_t) a > tech_pvt->dbg_w_peak) tech_pvt->dbg_w_peak = (uint32_t) a;
+      if (a >= 32000) tech_pvt->dbg_w_clip++;
+      tech_pvt->dbg_w_sumsq += (uint64_t)(v * v);
+      if (i > 0) {
+        int d = v - s[i - 1];
+        tech_pvt->dbg_w_sumabsdiff += (uint64_t)(d < 0 ? -d : d);
+        tech_pvt->dbg_w_interior_n++;
+      }
+    }
+    tech_pvt->dbg_w_samples += (uint32_t) n;
+    tech_pvt->dbg_w_frames++;
+
+    /* 50 frames of 20ms == one second. */
+    if (tech_pvt->dbg_w_frames >= 50) {
+      tech_pvt->dbg_windows_total++;
+      if (tech_pvt->dbg_w_samples > 0 && tech_pvt->dbg_w_interior_n > 0) {
+        double wrms = sqrt((double) tech_pvt->dbg_w_sumsq / (double) tech_pvt->dbg_w_samples);
+        double wmad = (double) tech_pvt->dbg_w_sumabsdiff / (double) tech_pvt->dbg_w_interior_n;
+        /* Ignore near-silent windows: with almost no signal the ratio is noise
+         * on noise and would produce false alarms. */
+        if (wrms > 200.0) {
+          int ratio = (int)(wmad * 100.0 / wrms);
+          if (ratio > tech_pvt->dbg_worst_ratio) {
+            tech_pvt->dbg_worst_ratio = ratio;
+            tech_pvt->dbg_worst_at_ms = tech_pvt->dbg_w_index * 1000;
+          }
+          /* Baseline measured across 20 calls is 23-25, so 40 is comfortably
+           * outside normal speech and marks a window worth looking at. */
+          if (ratio > 40) tech_pvt->dbg_windows_over++;
+        }
+      }
+      if (tech_pvt->dbg_w_clip > tech_pvt->dbg_worst_window_clip)
+        tech_pvt->dbg_worst_window_clip = tech_pvt->dbg_w_clip;
+
+      tech_pvt->dbg_w_index++;
+      tech_pvt->dbg_w_sumsq = tech_pvt->dbg_w_sumabsdiff = 0;
+      tech_pvt->dbg_w_samples = tech_pvt->dbg_w_interior_n = 0;
+      tech_pvt->dbg_w_frames = tech_pvt->dbg_w_clip = tech_pvt->dbg_w_peak = 0;
+    }
+  }
+
   static switch_status_t write_playback_frames_direct(private_t *tech_pvt, switch_core_session_t *session, int max_frames) {
     if (!tech_pvt || !session || !tech_pvt->playback_direct_mode || !tech_pvt->playback_codec_ready ||
-        !tech_pvt->playback_buffer || !tech_pvt->playback_mutex || tech_pvt->playback_frame_bytes <= 0) {
+        !tech_pvt->playback_buffer || !tech_pvt->playback_mutex || !tech_pvt->playback_chunk ||
+        tech_pvt->playback_frame_bytes <= 0) {
       return SWITCH_STATUS_FALSE;
     }
 
@@ -47,7 +165,7 @@ namespace {
       return SWITCH_STATUS_FALSE;
     }
 
-    std::vector<uint8_t> chunk((size_t)tech_pvt->playback_frame_bytes);
+    uint8_t *chunk = tech_pvt->playback_chunk;
 
     int frames_written = 0;
     while (max_frames <= 0 || frames_written < max_frames) {
@@ -55,7 +173,7 @@ namespace {
       switch_mutex_lock(tech_pvt->playback_mutex);
       size_t available = switch_buffer_inuse(tech_pvt->playback_buffer);
       if (available >= (size_t)tech_pvt->playback_frame_bytes) {
-        bytes_read = switch_buffer_read(tech_pvt->playback_buffer, chunk.data(), (size_t)tech_pvt->playback_frame_bytes);
+        bytes_read = switch_buffer_read(tech_pvt->playback_buffer, chunk, (size_t)tech_pvt->playback_frame_bytes);
       }
       switch_mutex_unlock(tech_pvt->playback_mutex);
 
@@ -63,9 +181,21 @@ namespace {
         break;
       }
 
+      dbg_measure_frame(tech_pvt, chunk, bytes_read);   /* [BUG-RE] TEMPORARY */
+
+      /* [BUG-RE] TEMPORARY: is the channel also playing something of its own
+       * right now? CF_BROADCAST is set while uuid_broadcast/playback owns the
+       * write path, so a frame written here at the same moment is a second
+       * source on one channel -- two voices mixed, which is what crackle and
+       * garbled speech sound like. */
+      tech_pvt->dbg_writes_total_checked++;
+      if (switch_channel_test_flag(channel, CF_BROADCAST)) {
+        tech_pvt->dbg_write_during_broadcast++;
+      }
+
       switch_frame_t frame = { 0 };
       frame.codec = &tech_pvt->playback_codec;
-      frame.data = chunk.data();
+      frame.data = chunk;
       frame.buflen = (uint32_t)bytes_read;
       frame.datalen = (uint32_t)bytes_read;
       frame.samples = (uint32_t)(bytes_read / sizeof(int16_t));
@@ -75,6 +205,8 @@ namespace {
       switch_time_t write_start = switch_micro_time_now();
       switch_status_t status = switch_core_session_write_frame(session, &frame, SWITCH_IO_FLAG_NONE, 0);
       switch_time_t write_elapsed_us = switch_micro_time_now() - write_start;
+      tech_pvt->dbg_direct_write_us += (uint64_t) write_elapsed_us;
+      tech_pvt->dbg_direct_frames++;
       if (status != SWITCH_STATUS_SUCCESS) {
         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
           "(%u) direct playback write failed: status=%d bytes=%zu\n",
@@ -83,25 +215,144 @@ namespace {
       }
       frames_written++;
 
-      if (write_elapsed_us > 30000) {
-        tech_pvt->dbg_direct_slow_writes++;
-        if (tech_pvt->dbg_direct_slow_writes == 1 || tech_pvt->dbg_direct_slow_writes % 20 == 0) {
-          switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING,
-            "(%u) [MOD-DIRECT-SLOW] #%u write_elapsed_ms=%lld frame_bytes=%zu\n",
-            tech_pvt->id, tech_pvt->dbg_direct_slow_writes,
-            (long long)(write_elapsed_us / 1000), bytes_read);
-        }
-      }
+      /* Counted, not logged: a write taking longer than a couple of frame
+       * intervals is expected under load and the per-event warning was pure
+       * noise at 50 calls. The total lands in [MOD-BINARY-SUMMARY]. */
+      if (write_elapsed_us > 30000) tech_pvt->dbg_direct_slow_writes++;
 
-      if (!tech_pvt->playback_logged_first_direct_write) {
-        tech_pvt->playback_logged_first_direct_write = 1;
-        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
-          "(%u) direct playback write active: frame_bytes=%d channel_rate=%d\n",
-          tech_pvt->id, tech_pvt->playback_frame_bytes, tech_pvt->playback_channel_rate);
+      /* [BUG-RE] TEMPORARY: interval between consecutive writes. This is the
+       * delivery cadence the caller actually hears, and nothing else measures
+       * it. Should be 20ms; a gap is silence, a bunch is catch-up. */
+      if (tech_pvt->dbg_last_write_us) {
+        uint64_t iv_us = (uint64_t)(write_start - tech_pvt->dbg_last_write_us);
+        /* Mean over speech intervals only. Including the 10-30s between-turn
+         * pauses inflated it to 31-55ms and made it unreadable. */
+        if (iv_us <= 500000) {
+          tech_pvt->dbg_write_iv_sum += iv_us;
+          tech_pvt->dbg_write_iv_n++;
+        }
+        /* Only 30-500ms counts as a dropout. Anything longer is the pause
+         * between turns while the caller speaks -- the first version counted
+         * those too, which is why worst_gap_ms came back as 13-31 SECONDS and
+         * made the figure useless. */
+        if (iv_us > 30000 && iv_us <= 500000) {
+          tech_pvt->dbg_write_gaps_30ms++;
+          uint32_t gap_ms = (uint32_t)(iv_us / 1000);
+          if (gap_ms > tech_pvt->dbg_write_worst_gap_ms) {
+            tech_pvt->dbg_write_worst_gap_ms = gap_ms;
+            /* offset in played audio, so it lines up with a recording */
+            tech_pvt->dbg_write_worst_at_ms = tech_pvt->dbg_direct_frames * 20;
+          }
+        }
+        else if (iv_us > 500000) tech_pvt->dbg_write_pauses++;
+        else if (iv_us < 10000) tech_pvt->dbg_write_bunch_10ms++;
       }
+      tech_pvt->dbg_last_write_us = (uint64_t) write_start;
     }
 
     return frames_written > 0 ? SWITCH_STATUS_SUCCESS : SWITCH_STATUS_FALSE;
+  }
+
+  /* ── Playback writer thread ───────────────────────────────────────────────
+   * One per session. Drains playback_buffer into the channel, letting
+   * switch_core_session_write_frame() block for its natural frame interval --
+   * that blocking IS the pacing, it just must not happen on the lws service
+   * thread, which is shared by every session and also has to flush uplink
+   * audio. When the buffer is empty we simply do not write, so the channel's
+   * own audio (file playback, silence) passes through untouched. */
+  static void *SWITCH_THREAD_FUNC playback_writer_thread(switch_thread_t *thread, void *obj) {
+    private_t *tech_pvt = (private_t *) obj;
+    switch_core_session_t *session = tech_pvt->session;
+
+    /* Real timer at the channel's frame interval. switch_core_timer_next()
+     * returns immediately when the tick is already due, so a write that did
+     * block does not get double-paced -- the cadence self-corrects. */
+    switch_timer_t timer = { 0 };
+    int have_timer = 0;
+    int interval_ms = 20;
+    if (nPlaybackPaced && tech_pvt->playback_channel_rate > 0 && tech_pvt->playback_frame_bytes > 0) {
+      int samples_per_packet = tech_pvt->playback_frame_bytes / 2;
+      interval_ms = samples_per_packet * 1000 / tech_pvt->playback_channel_rate;
+      if (interval_ms <= 0) interval_ms = 20;
+      if (switch_core_timer_init(&timer, "soft", interval_ms, samples_per_packet,
+            switch_core_session_get_pool(session)) == SWITCH_STATUS_SUCCESS) {
+        have_timer = 1;
+      }
+    }
+
+    switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG,
+      "(%u) playback writer thread started (paced=%d interval=%dms prime=%d)\n",
+      tech_pvt->id, have_timer, interval_ms, nPlaybackPrimeFrames);
+
+    /* Hold a couple of frames before the first write so that arrival jitter
+     * has something to eat into. Re-armed whenever the buffer runs dry, since
+     * flush and end-of-turn both empty it. */
+    int primed = 0;
+
+    while (!tech_pvt->playback_thread_stop) {
+      switch_channel_t *channel = switch_core_session_get_channel(session);
+      /* Exit only once the channel is really gone. A transiently not-ready
+       * channel is handled by write_playback_frames_direct returning FALSE,
+       * which just makes us retry -- we must not quit for good on that. */
+      if (!channel || !switch_channel_up(channel)) break;
+
+      if (!tech_pvt->playback_active || !tech_pvt->playback_buffer) {
+        primed = 0;
+        switch_yield(10000);   /* idle: nothing to play, latency here is free */
+        continue;
+      }
+
+      if (!primed) {
+        switch_mutex_lock(tech_pvt->playback_mutex);
+        size_t have = switch_buffer_inuse(tech_pvt->playback_buffer);
+        switch_mutex_unlock(tech_pvt->playback_mutex);
+        if (have < (size_t)(nPlaybackPrimeFrames * tech_pvt->playback_frame_bytes)) {
+          switch_yield(2000);
+          continue;
+        }
+        primed = 1;
+        /* v1.0.9 defect: the soft timer's reference kept advancing during the
+         * dry spell, so after re-priming, timer_next() was in arrears and
+         * returned immediately for every backlogged tick -- the writes came
+         * out in a burst, reproducing exactly the bunching being fixed.
+         * Resync so pacing restarts from now. */
+        if (have_timer) switch_core_timer_sync(&timer);
+      }
+
+      if (have_timer) switch_core_timer_next(&timer);
+
+      /* No separate "is there data" probe: write_playback_frames_direct already
+       * checks under the lock and reports FALSE when it wrote nothing, so
+       * peeking first only doubled the per-frame locking. */
+      if (write_playback_frames_direct(tech_pvt, session, 1) != SWITCH_STATUS_SUCCESS) {
+        primed = 0;            /* ran dry: re-prime before speaking again */
+        if (!have_timer) switch_yield(2000);
+      }
+    }
+
+    if (have_timer) switch_core_timer_destroy(&timer);
+
+    /* Nothing logged on exit: the same figures are in [MOD-BINARY-SUMMARY],
+     * which fires once per session in fork_session_cleanup. */
+    return NULL;
+  }
+
+  static void start_playback_writer(private_t *tech_pvt, switch_core_session_t *session) {
+    switch_threadattr_t *thd_attr = NULL;
+    switch_memory_pool_t *pool = switch_core_session_get_pool(session);
+
+    switch_threadattr_create(&thd_attr, pool);
+    switch_threadattr_detach_set(thd_attr, 0);   /* joinable: cleanup must join before freeing the buffer */
+    switch_threadattr_stacksize_set(thd_attr, SWITCH_THREAD_STACKSIZE);
+    switch_thread_create(&tech_pvt->playback_thread, thd_attr, playback_writer_thread, tech_pvt, pool);
+  }
+
+  static void stop_playback_writer(private_t *tech_pvt) {
+    if (!tech_pvt->playback_thread) return;
+    switch_status_t st = SWITCH_STATUS_SUCCESS;
+    tech_pvt->playback_thread_stop = 1;
+    switch_thread_join(&st, tech_pvt->playback_thread);
+    tech_pvt->playback_thread = NULL;
   }
 
   void processIncomingMessage(private_t* tech_pvt, switch_core_session_t* session, const char* message) {
@@ -121,7 +372,15 @@ namespace {
           const char* szAudioContentType = cJSON_GetObjectCstr(jsonData, "audioContentType");
           char fileType[6];
           int sampleRate = 16000;
-          if (0 == strcmp(szAudioContentType, "raw")) {
+          if (!szAudioContentType) {
+            /* Was an unguarded strcmp: a playAudio message without this field
+             * crashed the service thread, taking every other call with it. */
+            validAudio = 0;
+            switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,
+              "(%u) processIncomingMessage - playAudio missing audioContentType\n", tech_pvt->id);
+            strcpy(fileType, ".r16");
+          }
+          else if (0 == strcmp(szAudioContentType, "raw")) {
             cJSON* jsonSR = cJSON_GetObjectItem(jsonData, "sampleRate");
             sampleRate = jsonSR && jsonSR->valueint ? jsonSR->valueint : 0;
 
@@ -226,7 +485,11 @@ namespace {
           switch_buffer_zero(tech_pvt->playback_buffer);
           switch_mutex_unlock(tech_pvt->playback_mutex);
         }
-        switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO,
+        /* DEBUG, not INFO: these three fire several times per utterance, so at
+         * 50+ concurrent calls they are tens of lines a second of state that
+         * the [MOD-BINARY] counters already summarise. Turn DEBUG on when
+         * tracing a single call. */
+        switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG,
           "(%u) flush: cleared playback buffer\n", tech_pvt->id);
       }
       else if (0 == type.compare("enableBinaryPlayback")) {
@@ -254,7 +517,7 @@ namespace {
           }
         }
         tech_pvt->playback_active = 1;
-        switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO,
+        switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG,
           "(%u) enableBinaryPlayback: active=1 input_rate=%d channel_rate=%d\n",
           tech_pvt->id, tech_pvt->playback_input_rate, tech_pvt->playback_channel_rate);
       }
@@ -265,7 +528,7 @@ namespace {
           switch_buffer_zero(tech_pvt->playback_buffer);
           switch_mutex_unlock(tech_pvt->playback_mutex);
         }
-        switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO,
+        switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG,
           "(%u) disableBinaryPlayback: active=0\n", tech_pvt->id);
       }
       /* ────────────────────────────────────────────────────────────────────── */
@@ -375,6 +638,9 @@ namespace {
     if (metadata) strncpy(tech_pvt->initialMetadata, metadata, MAX_METADATA_LEN);
     
     /* ── Init binary playback state ───────────────────────────────────────── */
+    tech_pvt->session               = session;   /* used by the playback writer thread */
+    tech_pvt->playback_thread       = nullptr;
+    tech_pvt->playback_thread_stop  = 0;
     tech_pvt->playback_active       = 0;
     tech_pvt->playback_input_rate   = 8000;    /* backend sends channel-rate PCM in app-paced mode */
     tech_pvt->playback_channel_rate = (int) (write_impl.actual_samples_per_second ?
@@ -382,10 +648,10 @@ namespace {
     tech_pvt->playback_resampler    = nullptr;
     tech_pvt->playback_frame_bytes  = (int) (write_impl.decoded_bytes_per_packet ?
       write_impl.decoded_bytes_per_packet : read_impl.decoded_bytes_per_packet);
+    tech_pvt->playback_chunk        = tech_pvt->playback_frame_bytes > 0 ?
+      (uint8_t *) switch_core_session_alloc(session, (size_t) tech_pvt->playback_frame_bytes) : nullptr;
     tech_pvt->playback_direct_mode  = 0;
     tech_pvt->playback_codec_ready  = 0;
-    tech_pvt->playback_logged_first_direct_write = 0;
-    tech_pvt->playback_logged_write_replace_skip = 0;
     switch_mutex_init(&tech_pvt->playback_mutex, SWITCH_MUTEX_NESTED,
       switch_core_session_get_pool(session));
     /* Tiny jitter buffer only. Backend/app owns realtime pacing. */
@@ -403,14 +669,17 @@ namespace {
           NULL,
           switch_core_session_get_pool(session)) == SWITCH_STATUS_SUCCESS) {
       tech_pvt->playback_codec_ready = 1;
-      tech_pvt->playback_direct_mode = 1;  /* parked calls need direct writes; WRITE_REPLACE does not drain while parked */
-      switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
+      tech_pvt->playback_direct_mode = 1;  /* playback path armed; the writer thread owns it */
+      start_playback_writer(tech_pvt, session);
+      switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG,
         "(%u) playback direct mode armed: channel_rate=%d frame_bytes=%d\n",
         tech_pvt->id, tech_pvt->playback_channel_rate, tech_pvt->playback_frame_bytes);
     } else {
-      switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING,
-        "(%u) playback direct mode unavailable, falling back to WRITE_REPLACE queue\n",
-        tech_pvt->id);
+      /* There is no fallback path any more: WRITE_REPLACE was removed because it
+       * never ran, so failing to init the L16 codec means no binary playback. */
+      switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
+        "(%u) binary playback UNAVAILABLE: L16 codec init failed (channel_rate=%d frame_bytes=%d)\n",
+        tech_pvt->id, tech_pvt->playback_channel_rate, tech_pvt->playback_frame_bytes);
     }
     /* ────────────────────────────────────────────────────────────────────── */
     
@@ -454,8 +723,11 @@ namespace {
       switch_mutex_destroy(tech_pvt->mutex);
       tech_pvt->mutex = nullptr;
     }
-    /* ── Binary playback cleanup ─────────────────────────────────────────── */
+    /* ── Binary playback cleanup ───────────────────────────────────────────
+     * Join the writer thread FIRST: it touches playback_buffer, playback_mutex
+     * and playback_codec, all of which are torn down just below. */
     tech_pvt->playback_active = 0;
+    stop_playback_writer(tech_pvt);
     if (tech_pvt->playback_resampler) {
       speex_resampler_destroy(tech_pvt->playback_resampler);
       tech_pvt->playback_resampler = nullptr;
@@ -565,9 +837,14 @@ extern "C" {
   }
 
   switch_status_t fork_init() {
+    switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "mod_audio_fork: version:                   %s\n", MOD_AUDIO_FORK_VERSION);
     switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "mod_audio_fork: audio buffer (in secs):    %d secs\n", nAudioBufferSecs);
     switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "mod_audio_fork: sub-protocol:              %s\n", mySubProtocolName);
     switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "mod_audio_fork: lws service threads:       %d\n", nServiceThreads);
+    switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "mod_audio_fork: playback jitter frames:    %d (%d ms)\n",
+      nPlaybackJitterFrames, nPlaybackJitterFrames * RTP_PACKETIZATION_PERIOD);
+    switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "mod_audio_fork: playback paced / prime:     %d / %d frames\n",
+      nPlaybackPaced, nPlaybackPrimeFrames);
  
     int logs = LLL_ERR | LLL_WARN | LLL_NOTICE ;
      //LLL_INFO | LLL_PARSER | LLL_HEADER | LLL_EXT | LLL_CLIENT  | LLL_LATENCY | LLL_DEBUG ;
@@ -661,19 +938,81 @@ extern "C" {
     }
 
     if (pAudioPipe && text) pAudioPipe->bufferForSending(text);
+
+    /* Snapshot uplink stats before close(): once closed, the lws thread deletes
+     * the AudioPipe on LWS_CALLBACK_CLIENT_CLOSED and the pointer goes stale. */
+    uint32_t uplinkFlushes = pAudioPipe ? pAudioPipe->getFlushCount() : 0;
+    uint32_t uplinkQueues  = pAudioPipe ? pAudioPipe->getQueueCount() : 0;
+    uint64_t uplinkKb      = pAudioPipe ? pAudioPipe->getFlushedBytes() / 1024 : 0;
+
     if (pAudioPipe) pAudioPipe->close();
 
     if (tech_pvt->dbg_binary_frames_rx > 0) {
       switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
-        "(%u) [MOD-BINARY-SUMMARY] rx=%u bad_frame_size=%u direct_slow_writes=%u input_rate=%d channel_rate=%d frame_bytes=%d\n",
+        "(%u) [MOD-BINARY-SUMMARY] rx=%u bad_frame_size=%u direct_slow_writes=%u input_rate=%d channel_rate=%d frame_bytes=%d "
+        "playback_hwm=%u playback_overflow_frames=%u "
+        "direct_frames=%u direct_write_ms=%llu avg_write_us=%llu uplink_flushes=%u uplink_queues=%u uplink_kb=%llu\n",
         id,
         tech_pvt->dbg_binary_frames_rx,
         tech_pvt->dbg_binary_bad_frame_size,
         tech_pvt->dbg_direct_slow_writes,
         tech_pvt->playback_input_rate,
         tech_pvt->playback_channel_rate,
-        tech_pvt->playback_frame_bytes);
+        tech_pvt->playback_frame_bytes,
+        tech_pvt->dbg_playback_hwm_bytes,
+        tech_pvt->dbg_playback_overflow_frames,
+        tech_pvt->dbg_direct_frames,
+        (unsigned long long)(tech_pvt->dbg_direct_write_us / 1000),
+        (unsigned long long)(tech_pvt->dbg_direct_frames ?
+          tech_pvt->dbg_direct_write_us / tech_pvt->dbg_direct_frames : 0),
+        uplinkFlushes, uplinkQueues, (unsigned long long) uplinkKb);
+
+      /* [BUG-RE] TEMPORARY: what the waveform itself looked like.
+       * mad_x100_over_rms is the number to read: clean telephony speech lands
+       * well under 100; at or above 100 the signal carries high-frequency
+       * content 8 kHz cannot represent, which is what crackle is. */
+      if (tech_pvt->dbg_a_samples > 0) {
+        double rms = sqrt((double) tech_pvt->dbg_a_sumsq / (double) tech_pvt->dbg_a_samples);
+        double mad = tech_pvt->dbg_a_interior_n
+          ? (double) tech_pvt->dbg_a_sumabsdiff / (double) tech_pvt->dbg_a_interior_n : 0.0;
+        double bstep = tech_pvt->dbg_a_bstep_n
+          ? (double) tech_pvt->dbg_a_bstep_sum / (double) tech_pvt->dbg_a_bstep_n : 0.0;
+        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
+          "(%u) [MOD-AUDIO-STATS-C] samples=%llu rms=%d peak=%u clip=%u zero_frames=%u "
+          "mad=%d mad_x100_over_rms=%d bstep_mean=%d bstep_max=%u bstep_n=%u "
+          "writes=%u during_broadcast=%u "
+          "worst_1s_ratio=%d worst_at_ms=%u worst_1s_clip=%u windows_over40=%u/%u "
+          "write_iv_mean_ms=%d gaps30_500=%u bunch10=%u pauses=%u worst_gap_ms=%u worst_gap_at_ms=%u "
+          "rx_iv_mean_ms=%d rx_gaps30_500=%u rx_bunch10=%u rx_pauses=%u rx_worst_gap_ms=%u rx_worst_at_ms=%u\n",
+          id,
+          (unsigned long long) tech_pvt->dbg_a_samples,
+          (int) rms, tech_pvt->dbg_a_peak, tech_pvt->dbg_a_clip, tech_pvt->dbg_a_zero_frames,
+          (int) mad, rms > 0.0 ? (int)(mad * 100.0 / rms) : -1,
+          (int) bstep, tech_pvt->dbg_a_bstep_max, tech_pvt->dbg_a_bstep_n,
+          tech_pvt->dbg_writes_total_checked, tech_pvt->dbg_write_during_broadcast,
+          tech_pvt->dbg_worst_ratio, tech_pvt->dbg_worst_at_ms,
+          tech_pvt->dbg_worst_window_clip,
+          tech_pvt->dbg_windows_over, tech_pvt->dbg_windows_total,
+          tech_pvt->dbg_write_iv_n
+            ? (int)(tech_pvt->dbg_write_iv_sum / tech_pvt->dbg_write_iv_n / 1000) : -1,
+          tech_pvt->dbg_write_gaps_30ms, tech_pvt->dbg_write_bunch_10ms,
+          tech_pvt->dbg_write_pauses,
+          tech_pvt->dbg_write_worst_gap_ms, tech_pvt->dbg_write_worst_at_ms,
+          tech_pvt->dbg_rx_iv_n
+            ? (int)(tech_pvt->dbg_rx_iv_sum / tech_pvt->dbg_rx_iv_n / 1000) : -1,
+          tech_pvt->dbg_rx_gaps_30ms, tech_pvt->dbg_rx_bunch_10ms,
+          tech_pvt->dbg_rx_pauses,
+          tech_pvt->dbg_rx_worst_gap_ms, tech_pvt->dbg_rx_worst_at_ms);
+      }
     }
+
+    /* Nothing can reach this tech_pvt through the channel any more (the bug was
+     * detached above under this lock), so release before tearing down --
+     * destroy_tech_pvt destroys this very mutex, and destroying a locked mutex
+     * is undefined. It also joins the writer thread, which we would rather not
+     * wait for while holding a lock. */
+    tech_pvt->pAudioPipe = nullptr;
+    switch_mutex_unlock(tech_pvt->mutex);
 
     destroy_tech_pvt(tech_pvt);
     switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, "(%u) fork_session_cleanup: connection closed\n", id);
@@ -764,8 +1103,24 @@ extern "C" {
               tech_pvt->buffer_overrun_notified = 1;
               tech_pvt->responseHandler(session, EVENT_BUFFER_OVERRUN, NULL);
             }
-            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "(%u) dropping packets!\n", 
-              tech_pvt->id);
+            /* Report *why* we ran out of room: the buffer only overflows if the
+             * lws service thread stopped flushing it. since_flush_ms growing to
+             * the full buffer depth (nAudioBufferSecs) means zero drain. */
+            uint64_t nowus = AudioPipe::nowUs();
+            uint64_t lastFlush = pAudioPipe->getLastFlushUs();
+            uint64_t lastQueue = pAudioPipe->getLastQueueUs();
+            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
+              "(%u) dropping packets! [MOD-UPLINK-STALL] since_flush_ms=%lld since_queue_ms=%lld "
+              "flushes=%u queues=%u flushed_kb=%llu offset=%zu buf_max=%zu lws_state=%d\n",
+              tech_pvt->id,
+              lastFlush ? (long long)((nowus - lastFlush) / 1000) : -1LL,
+              lastQueue ? (long long)((nowus - lastQueue) / 1000) : -1LL,
+              pAudioPipe->getFlushCount(),
+              pAudioPipe->getQueueCount(),
+              (unsigned long long)(pAudioPipe->getFlushedBytes() / 1024),
+              pAudioPipe->getWriteOffset(),
+              pAudioPipe->getWriteOffset() + available,
+              (int) pAudioPipe->getLwsState());
             pAudioPipe->binaryWritePtrResetToZero();
 
             frame.data = pAudioPipe->binaryWritePtr();
@@ -808,8 +1163,15 @@ extern "C" {
             if (available < pAudioPipe->binaryMinSpace()) {
               if (!tech_pvt->buffer_overrun_notified) {
                 tech_pvt->buffer_overrun_notified = 1;
-                switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "(%u) dropping packets!\n", 
-                  tech_pvt->id);
+                uint64_t nowus = AudioPipe::nowUs();
+                uint64_t lastFlush = pAudioPipe->getLastFlushUs();
+                switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
+                  "(%u) dropping packets! [MOD-UPLINK-STALL resampled] since_flush_ms=%lld flushes=%u queues=%u lws_state=%d\n",
+                  tech_pvt->id,
+                  lastFlush ? (long long)((nowus - lastFlush) / 1000) : -1LL,
+                  pAudioPipe->getFlushCount(),
+                  pAudioPipe->getQueueCount(),
+                  (int) pAudioPipe->getLwsState());
                 tech_pvt->responseHandler(session, EVENT_BUFFER_OVERRUN, NULL);
               }
               break;
@@ -825,10 +1187,11 @@ extern "C" {
   }
 
   /* ── fork_session_handle_binary ───────────────────────────────────────────
-   * Called from eventCallback when a BINARY_AUDIO event fires.
-  * Resamples inbound PCM (playback_input_rate → playback_channel_rate),
-  * writes the result into a tiny per-session jitter buffer, then writes at most
-  * one channel frame in direct mode. Backend/app owns 20ms realtime pacing.
+   * Called from eventCallback when a BINARY_AUDIO event fires, on the shared
+   * lws service thread. Resamples inbound PCM (playback_input_rate ->
+   * playback_channel_rate) into the per-session jitter buffer and returns
+   * immediately. The session's own writer thread drains it and does the
+   * blocking write to the channel.
    * ─────────────────────────────────────────────────────────────────────── */
   void fork_session_handle_binary(private_t *tech_pvt, switch_core_session_t *session, const uint8_t *data, size_t len) {
     if (!tech_pvt || !tech_pvt->playback_active || !tech_pvt->playback_buffer || !data || len == 0)
@@ -854,9 +1217,8 @@ extern "C" {
     if (write_samples == 0) return;
 
     size_t write_bytes = write_samples * 2;
-    const size_t MAX_BUFFER = tech_pvt->playback_frame_bytes > 0
-      ? (size_t)tech_pvt->playback_frame_bytes * PLAYBACK_JITTER_FRAMES
-      : FRAME_SIZE_8000 * PLAYBACK_JITTER_FRAMES;
+    const size_t MAX_BUFFER = (size_t)nPlaybackJitterFrames *
+      (tech_pvt->playback_frame_bytes > 0 ? (size_t)tech_pvt->playback_frame_bytes : FRAME_SIZE_8000);
 
     if (tech_pvt->playback_frame_bytes > 0 && write_bytes != (size_t)tech_pvt->playback_frame_bytes) {
       tech_pvt->dbg_binary_bad_frame_size++;
@@ -871,28 +1233,69 @@ extern "C" {
 
     switch_mutex_lock(tech_pvt->playback_mutex);
     size_t inuse = switch_buffer_inuse(tech_pvt->playback_buffer);
+    if (inuse > tech_pvt->dbg_playback_hwm_bytes)
+      tech_pvt->dbg_playback_hwm_bytes = (uint32_t) inuse;
     if (inuse + write_bytes > MAX_BUFFER) {
       /* Overflow: drop oldest data to make room */
       size_t drop = (inuse + write_bytes) - MAX_BUFFER;
       if (drop > inuse) drop = inuse;
       switch_buffer_toss(tech_pvt->playback_buffer, drop);
-      switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
-        "(%u) [MOD-BINARY] OVERFLOW: dropped %zu B | inuse_before=%zu write_bytes=%zu\n",
-        tech_pvt->id, drop, inuse, write_bytes);
+      tech_pvt->dbg_playback_overflow_frames++;
+      /* Rate-limited: one full-buffer episode produces a run of these, and at
+       * 50 sessions the unthrottled version buried everything else. */
+      if (tech_pvt->dbg_playback_overflow_frames == 1 ||
+          tech_pvt->dbg_playback_overflow_frames % 25 == 0) {
+        switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+          "(%u) [MOD-BINARY] OVERFLOW #%u: dropped %zu B | inuse_before=%zu write_bytes=%zu max_buffer=%zu depth_frames=%d\n",
+          tech_pvt->id, tech_pvt->dbg_playback_overflow_frames,
+          drop, inuse, write_bytes, MAX_BUFFER, nPlaybackJitterFrames);
+      }
     }
     switch_buffer_write(tech_pvt->playback_buffer, write_ptr, write_bytes);
-    size_t inuse_after = switch_buffer_inuse(tech_pvt->playback_buffer);
     switch_mutex_unlock(tech_pvt->playback_mutex);
 
     tech_pvt->dbg_binary_frames_rx++;
-    if (tech_pvt->dbg_binary_frames_rx == 1 || tech_pvt->dbg_binary_frames_rx % 1000 == 0) {
-      switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
-        "(%u) [MOD-BINARY] rx=%u write_bytes=%zu inuse_before=%zu inuse_after=%zu max_buffer=%zu\n",
-        tech_pvt->id, tech_pvt->dbg_binary_frames_rx, write_bytes, inuse, inuse_after, MAX_BUFFER);
+
+    /* [BUG-RE] TEMPORARY: arrival cadence -- when frames REACH us, before any
+     * buffering. The counterpart of the write cadence below; comparing the two
+     * on one call locates the jitter source. Runs on the lws service thread. */
+    {
+      uint64_t rx_now = AudioPipe::nowUs();
+      if (tech_pvt->dbg_last_rx_us) {
+        uint64_t iv_us = rx_now - tech_pvt->dbg_last_rx_us;
+        if (iv_us <= 500000) {
+          tech_pvt->dbg_rx_iv_sum += iv_us;
+          tech_pvt->dbg_rx_iv_n++;
+          if (iv_us > 30000) {
+            tech_pvt->dbg_rx_gaps_30ms++;
+            uint32_t gap_ms = (uint32_t)(iv_us / 1000);
+            if (gap_ms > tech_pvt->dbg_rx_worst_gap_ms) {
+              tech_pvt->dbg_rx_worst_gap_ms = gap_ms;
+              tech_pvt->dbg_rx_worst_at_ms = tech_pvt->dbg_binary_frames_rx * 20;
+            }
+          }
+          else if (iv_us < 10000) tech_pvt->dbg_rx_bunch_10ms++;
+        }
+        else tech_pvt->dbg_rx_pauses++;
+      }
+      tech_pvt->dbg_last_rx_us = rx_now;
     }
-    if (tech_pvt->playback_direct_mode && session) {
-      write_playback_frames_direct(tech_pvt, session, 1);
+
+    /* [BUG-RE] TEMPORARY: dump exactly what arrived, before the jitter buffer
+     * and before any resampling, so the bytes can be listened to directly. */
+    if (dumpPcmUuid && (0 == strcmp(dumpPcmUuid, "all") ||
+                        0 == strcmp(dumpPcmUuid, tech_pvt->sessionId))) {
+      char szDumpPath[512];
+      switch_snprintf(szDumpPath, sizeof(szDumpPath), "%s%s%s.rx.raw",
+        SWITCH_GLOBAL_dirs.temp_dir, SWITCH_PATH_SEPARATOR, tech_pvt->sessionId);
+      std::ofstream f(szDumpPath, std::ios::binary | std::ios::app);
+      if (f.is_open()) {
+        f.write((const char *) data, (std::streamsize) len);
+        f.close();
+      }
     }
+    /* Deliberately no write_frame here: this runs on the shared lws service
+     * thread. The per-session playback writer thread picks the data up. */
   }
 
 }

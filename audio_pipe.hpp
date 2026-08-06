@@ -4,9 +4,9 @@
 #include <string>
 #include <list>
 #include <mutex>
-#include <queue>
-#include <unordered_map>
 #include <thread>
+#include <atomic>
+#include <vector>
 
 #include <libwebsockets.h>
 
@@ -86,6 +86,17 @@ public:
   const uint8_t* getBinaryPayload(void) const { return m_binary_payload; }
   size_t         getBinaryPayloadLen(void) const { return m_binary_payload_len; }
 
+  /* Uplink drain accounting. Cheap counters kept in production so that when
+   * fork_frame has to drop packets it can say how long the lws thread had
+   * actually gone without flushing this pipe, instead of just "buffer full". */
+  static uint64_t nowUs(void);
+  uint64_t getLastFlushUs(void) const { return m_stat_last_flush_us; }
+  uint64_t getLastQueueUs(void) const { return m_stat_last_queue_us; }
+  uint32_t getFlushCount(void) const { return m_stat_flush_count; }
+  uint32_t getQueueCount(void) const { return m_stat_queue_count; }
+  uint64_t getFlushedBytes(void) const { return m_stat_flushed_bytes; }
+  size_t   getWriteOffset(void) const { return m_audio_buffer_write_offset; }
+
   void close() ;
 
   // no default constructor or copying
@@ -95,8 +106,8 @@ public:
 
 private:
 
-  static int lws_callback(struct lws *wsi, enum lws_callback_reasons reason, void *user, void *in, size_t len); 
-  static unsigned int nchild;
+  static int lws_callback(struct lws *wsi, enum lws_callback_reasons reason, void *user, void *in, size_t len);
+  static std::atomic<unsigned int> nchild;
   static struct lws_context *contexts[];
   static unsigned int numContexts;
   static std::string protocolName;
@@ -108,9 +119,14 @@ private:
   static std::list<AudioPipe*> pendingWrites;
   static log_emit_function logger;
 
-  static std::mutex mapMutex;
-  static std::unordered_map<std::thread::id, bool> stopFlags;
-  static std::queue<std::thread::id> threadIds;
+  /* Service thread lifecycle. Threads are joinable and each owns (creates and
+   * destroys) its own lws context, so unloading the module cannot leave a
+   * thread behind still servicing the next generation's context.
+   * mutex_contexts serialises the contexts[] slots so a wakeup can never land
+   * on a context another thread is destroying. */
+  static std::atomic<bool> stopping;
+  static std::vector<std::thread> serviceThreads;
+  static std::mutex mutex_contexts;
 
   static AudioPipe* findAndRemovePendingConnect(struct lws *wsi);
   static AudioPipe* findPendingConnect(struct lws *wsi);
@@ -118,8 +134,12 @@ private:
   static void addPendingDisconnect(AudioPipe* ap);
   static void addPendingWrite(AudioPipe* ap);
   static void processPendingConnects(lws_per_vhost_data *vhd);
+  /* Both take the calling thread's vhd and only touch pipes that belong to it:
+   * lws_callback_on_writable() may only be called from the service thread that
+   * owns the wsi, so with more than one service thread the old
+   * process-everything behaviour was a cross-context race. */
   static void processPendingDisconnects(lws_per_vhost_data *vhd);
-  static void processPendingWrites(void);
+  static void processPendingWrites(lws_per_vhost_data *vhd);
   
   bool connect_client(struct lws_per_vhost_data *vhd);
 
@@ -151,6 +171,13 @@ private:
   /* binary payload scratch — written by lws thread, consumed by eventCallback */
   uint8_t  *m_binary_payload;      /* points into in; only valid during LWS_CALLBACK_CLIENT_RECEIVE */
   size_t    m_binary_payload_len;
+
+  /* instrumentation counters — written by lws thread, read for logging only */
+  uint64_t m_stat_last_flush_us;   /* last successful lws_write of uplink audio */
+  uint64_t m_stat_last_queue_us;   /* last addPendingWrite for uplink audio */
+  uint32_t m_stat_flush_count;
+  uint32_t m_stat_queue_count;
+  uint64_t m_stat_flushed_bytes;
 };
 
 #endif
